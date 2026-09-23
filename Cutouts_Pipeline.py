@@ -1,6 +1,7 @@
 import numpy as np
 import os
 import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw
 from astropy.visualization import simple_norm
 from astropy.io import fits
 from scipy.ndimage import uniform_filter
@@ -18,6 +19,11 @@ parser.add_argument(
     default=None,
     help="Two-character detector code to process, e.g. '11' or '24'. "
          "If omitted, all detectors in the file are processed.",
+)
+parser.add_argument(
+    "--force",
+    action="store_true",
+    help="Reprocess a detector even if its detections CSV already exists.",
 )
 args = parser.parse_args()
 fits_path = args.fits_path
@@ -343,6 +349,11 @@ det_codes_to_process = [args.det_code] if args.det_code is not None else list(de
 print(f"Processing detectors: {det_codes_to_process}")
 
 for DET_CODE in det_codes_to_process:
+    out_csv = f"detections_{fits_id}_DET{DET_CODE}.csv"
+    if os.path.exists(out_csv) and not args.force:
+        print(f"Skipping DET{DET_CODE} ({out_csv} already exists; use --force to reprocess)")
+        continue
+
     for f in glob.glob(os.path.join(CUTOUT_DIR, f"cutout_{fits_id}_DET{DET_CODE}_*.npy")):
         os.remove(f)
 
@@ -449,221 +460,191 @@ for DET_CODE in det_codes_to_process:
     all_merged = merged_cold + merged_hot + merged_dark
 
     norm_vis = simple_norm(cs_inpainted, stretch='asinh', min_percent=1, max_percent=99)
-    fig, ax  = plt.subplots(figsize=(10, 10))
-    ax.imshow(cs_inpainted, origin='lower', cmap='gray', norm=norm_vis)
-    ax.axis('off')
 
-    # Save the clean detector image before any box overlays are drawn on it,
-    # into its field/detector subdirectory (e.g. 2681/11/) regardless of cwd
+    # Write the array straight to a raster via imsave — no Figure/Axes, no dpi,
+    # no bbox cropping. imshow()+savefig() still resamples through Agg even at
+    # nominal 1:1 scale (verified: a single bright pixel bleeds across 2 output
+    # rows even with interpolation='none'), so imsave is the only path that's
+    # actually pixel-exact: output is exactly cs_inpainted.shape, one raster
+    # pixel per array element, no antialiasing. origin='upper' keeps raster
+    # row 0 == array row 0, matching the unflipped array-index convention used
+    # everywhere downstream (SAM cutout display, sam_x0/y0, cutout_x0/y0, mask
+    # arrays) — coordinates paste directly, no transform needed on reload.
+    rgba = plt.cm.gray(norm_vis(cs_inpainted))
+
     field = fits_id.split('_')[0]
     noboxes_dir = os.path.join(SCRIPT_DIR, field, DET_CODE)
     os.makedirs(noboxes_dir, exist_ok=True)
-    plt.savefig(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_noboxes.jpg"),
-                bbox_inches='tight')
+    noboxes_path = os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_noboxes.png")
+    plt.imsave(noboxes_path, rgba, origin='upper')
 
-    # ax.set_title(
-    #     f'DET{DET_CODE} — final detections: {len(merged_cold) + len(merged_hot)} sources',
-    #     fontsize=11
-    # )
+    # Draw detection boxes (same pixel coordinates that go into the detections CSV)
+    # directly in pixel space with PIL — also no resampling — onto a second,
+    # boxed copy at the same exact detector-pixel dimensions.
+    boxed = Image.open(noboxes_path).convert('RGB')
+    draw = ImageDraw.Draw(boxed)
+    for obj in all_merged:
+        xmin, ymin, xmax, ymax = bbox_of(obj)
+        draw.rectangle(
+            [xmin - pad, ymin - pad, xmax + pad, ymax + pad],
+            outline=(65, 105, 225),  # royalblue
+            width=1,
+        )
+    boxed.save(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}.png"))
 
-    # for obj in all_merged:
-    #     xmin, ymin, xmax, ymax = bbox_of(obj)
-    #     ax.add_patch(plt.matplotlib.patches.Rectangle(
-    #         xy=(xmin - pad, ymin - pad),
-    #         width=(xmax - xmin) + 2 * pad, height=(ymax - ymin) + 2 * pad,
-    #         edgecolor='royalblue', facecolor='none', linewidth=0.7, linestyle='--'
-    #     ))
+    # ---------- Cutouts ----------
 
-    # plt.tight_layout()
-    # plt.savefig(f"{fits_id}_DET{DET_CODE}.png", dpi=150, bbox_inches='tight')
-    # plt.close()
+    dark_bbox_set = {tuple(int(v) for v in o['bbox']) for o in merged_dark}
+    all_boxes = [
+        {'xmin': int(o['bbox'][0]), 'ymin': int(o['bbox'][1]),
+         'xmax': int(o['bbox'][2]), 'ymax': int(o['bbox'][3]),
+         'source_type': 'dark' if tuple(int(v) for v in o['bbox']) in dark_bbox_set else 'bright',
+         'centers': o['sub_centroids']}
+        for o in all_merged
+    ]
 
-    # # ---------- Cutouts ----------
-    
-    # dark_bbox_set = {tuple(int(v) for v in o['bbox']) for o in merged_dark}
-    # all_boxes = [
-    #     {'xmin': int(o['bbox'][0]), 'ymin': int(o['bbox'][1]),
-    #      'xmax': int(o['bbox'][2]), 'ymax': int(o['bbox'][3]),
-    #      'source_type': 'dark' if tuple(int(v) for v in o['bbox']) in dark_bbox_set else 'bright',
-    #      'centers': o['sub_centroids']}
-    #     for o in all_merged
-    # ]
-
-    # normal_boxes = [b for b in all_boxes
-    #             if max(b['xmax'] - b['xmin'], b['ymax'] - b['ymin']) >= TINY_MAX_DIM]
-    # tiny_boxes   = [b for b in all_boxes
-    #                 if max(b['xmax'] - b['xmin'], b['ymax'] - b['ymin']) <  TINY_MAX_DIM]
-    # print(f"Normal: {len(normal_boxes)}   Tiny (< {TINY_MAX_DIM} px): {len(tiny_boxes)}")
+    normal_boxes = [b for b in all_boxes
+                if max(b['xmax'] - b['xmin'], b['ymax'] - b['ymin']) >= TINY_MAX_DIM]
+    tiny_boxes   = [b for b in all_boxes
+                    if max(b['xmax'] - b['xmin'], b['ymax'] - b['ymin']) <  TINY_MAX_DIM]
+    print(f"Normal: {len(normal_boxes)}   Tiny (< {TINY_MAX_DIM} px): {len(tiny_boxes)}")
 
 
-    # cutouts            = [make_cutout(b, cs_inpainted) for b in normal_boxes]
-    # cutouts_precontsub = [make_cutout(b, sci_masked)   for b in normal_boxes]
+    cutouts            = [make_cutout(b, cs_inpainted) for b in normal_boxes]
+    cutouts_precontsub = [make_cutout(b, sci_masked)   for b in normal_boxes]
 
-    # for box, (cutout, lxmin, lymin, lxmax, lymax, crop_x0, crop_y0), (precontsub, *_) in zip(normal_boxes, cutouts, cutouts_precontsub):
-    #     x0, y0 = box['xmin'], box['ymin']
-    #     x1, y1 = box['xmax'], box['ymax']
-    #     h_co, w_co = cutout.shape
-    #     lxmin_pad = max(0,    lxmin - BBOX_PAD)
-    #     lymin_pad = max(0,    lymin - BBOX_PAD)
-    #     lxmax_pad = min(w_co, lxmax + BBOX_PAD)
-    #     lymax_pad = min(h_co, lymax + BBOX_PAD)
-    #     stem = f"cutout_{fits_id}_DET{DET_CODE}_{x0}_{x1}_{y0}_{y1}"
-    #     np.save(os.path.join(CUTOUT_DIR, f"{stem}.npy"),            cutout.astype(np.float32))
-    #     np.save(os.path.join(CUTOUT_DIR, f"{stem}_precontsub.npy"), precontsub.astype(np.float32))
-    #     np.save(os.path.join(CUTOUT_DIR, f"{stem}_bbox.npy"),
-    #             np.array([lxmin_pad, lymin_pad, lxmax_pad, lymax_pad], dtype=np.float32))
-    #     local_centers = np.array(
-    #         [[cx - crop_x0, cy - crop_y0] for cx, cy in box['centers']], dtype=np.float32)
-    #     np.save(os.path.join(CUTOUT_DIR, f"{stem}_points.npy"), local_centers)
-    #     if box.get('source_type') == 'dark':
-    #         np.save(os.path.join(CUTOUT_DIR, f"{stem}_dark.npy"), np.array(True))
-
-
+    for box, (cutout, lxmin, lymin, lxmax, lymax, crop_x0, crop_y0), (precontsub, *_) in zip(normal_boxes, cutouts, cutouts_precontsub):
+        x0, y0 = box['xmin'], box['ymin']
+        x1, y1 = box['xmax'], box['ymax']
+        h_co, w_co = cutout.shape
+        lxmin_pad = max(0,    lxmin - BBOX_PAD)
+        lymin_pad = max(0,    lymin - BBOX_PAD)
+        lxmax_pad = min(w_co, lxmax + BBOX_PAD)
+        lymax_pad = min(h_co, lymax + BBOX_PAD)
+        stem = f"cutout_{fits_id}_DET{DET_CODE}_{x0}_{x1}_{y0}_{y1}"
+        np.save(os.path.join(CUTOUT_DIR, f"{stem}.npy"),            cutout.astype(np.float32))
+        np.save(os.path.join(CUTOUT_DIR, f"{stem}_precontsub.npy"), precontsub.astype(np.float32))
+        np.save(os.path.join(CUTOUT_DIR, f"{stem}_bbox.npy"),
+                np.array([lxmin_pad, lymin_pad, lxmax_pad, lymax_pad], dtype=np.float32))
+        local_centers = np.array(
+            [[cx - crop_x0, cy - crop_y0] for cx, cy in box['centers']], dtype=np.float32)
+        np.save(os.path.join(CUTOUT_DIR, f"{stem}_points.npy"), local_centers)
+        if box.get('source_type') == 'dark':
+            np.save(os.path.join(CUTOUT_DIR, f"{stem}_dark.npy"), np.array(True))
 
 
-    # on_frame = zo_det >= 0
-    # print(f"On this FITS frame: {on_frame.sum():,} / {len(zo_table):,}")
+    on_frame = zo_det >= 0
+    print(f"On this FITS frame: {on_frame.sum():,} / {len(zo_table):,}")
 
-    # det_idx = DetIndex(DET_CODE).idx
-    # on_this_det = (zo_det == det_idx)
-    # print(f"On DET{DET_CODE}: {on_this_det.sum()}")
+    det_idx = DetIndex(DET_CODE).idx
+    on_this_det = (zo_det == det_idx)
+    print(f"On DET{DET_CODE}: {on_this_det.sum()}")
 
-    # zo_x_det = zo_x[on_this_det]
-    # zo_y_det = zo_y[on_this_det]
-    # if len(zo_x_det):
-    #     print(f"  x range: {zo_x_det.min():.1f} – {zo_x_det.max():.1f}")
-    #     print(f"  y range: {zo_y_det.min():.1f} – {zo_y_det.max():.1f}")
+    zo_x_det = zo_x[on_this_det]
+    zo_y_det = zo_y[on_this_det]
+    if len(zo_x_det):
+        print(f"  x range: {zo_x_det.min():.1f} – {zo_x_det.max():.1f}")
+        print(f"  y range: {zo_y_det.min():.1f} – {zo_y_det.max():.1f}")
 
-    # # ── Show ALL on-frame zo sources across all detectors (det layout check) ──
-    # # print(f"\nAll on-frame ZO sources by detector:")
+    # Rotation + scale matrix (same as main.py process_detector)
+    tilt_rad = np.deg2rad(grism_angle)
+    A_inv = np.linalg.inv(np.array([
+        [ZO_W_SCALE * np.cos(tilt_rad), -ZO_H_SCALE * np.sin(tilt_rad)],
+        [ZO_W_SCALE * np.sin(tilt_rad),  ZO_H_SCALE * np.cos(tilt_rad)]
+    ]))
 
-    # # Rotation + scale matrix (same as main.py process_detector)
-    # tilt_rad = np.deg2rad(grism_angle)
-    # A_inv = np.linalg.inv(np.array([
-    #     [ZO_W_SCALE * np.cos(tilt_rad), -ZO_H_SCALE * np.sin(tilt_rad)],
-    #     [ZO_W_SCALE * np.sin(tilt_rad),  ZO_H_SCALE * np.cos(tilt_rad)]
-    # ]))
+    zpos = np.column_stack((zo_x_det, zo_y_det)) if len(zo_x_det) else np.empty((0, 2))
 
-    # # zo_x_det / zo_y_det come from the cell above
-    # zpos = np.column_stack((zo_x_det, zo_y_det)) if len(zo_x_det) else np.empty((0, 2))
+    # ── Match each box against the ZO catalog ─────────────────────────────────
+    zo_matched = []
+    unmatched  = []
 
-    # # ── Match each box against the ZO catalog ─────────────────────────────────
-    # zo_matched = []
-    # unmatched  = []
+    for obj in all_merged:
+        cx, cy = obj['centroid']
+        if len(zpos) == 0:
+            unmatched.append(obj)
+            continue
+        delta = zpos - np.array([cx, cy])           # (N, 2) offsets to all ZO sources
+        transformed = (A_inv @ delta.T).T           # apply elliptical scaling + rotation
+        dists = np.linalg.norm(transformed, axis=1)
+        if dists.min() < ZO_MIN_DST_THRESHOLD:
+            zo_matched.append(obj)
+        else:
+            unmatched.append(obj)
 
-    # for obj in all_merged:
-    #     cx, cy = obj['centroid']
-    #     if len(zpos) == 0:
-    #         unmatched.append(obj)
-    #         continue
-    #     delta = zpos - np.array([cx, cy])           # (N, 2) offsets to all ZO sources
-    #     transformed = (A_inv @ delta.T).T           # apply elliptical scaling + rotation
-    #     dists = np.linalg.norm(transformed, axis=1)
-    #     if dists.min() < ZO_MIN_DST_THRESHOLD:
-    #         zo_matched.append(obj)
-    #     else:
-    #         unmatched.append(obj)
+    print(f"ZO matched: {len(zo_matched)}   Unmatched: {len(unmatched)}")
 
-    # print(f"ZO matched: {len(zo_matched)}   Unmatched: {len(unmatched)}")
+    # ── Build detection CSV ────────────────────────────────────────────────────
+    # All coordinates are in the individual detector's own pixel space.
+    #
+    # Columns:
+    #   source_fits                   — original FITS basename (trace back to main file + detector)
+    #   det_code                      — two-char detector code, e.g. "11"
+    #   det_xmin/ymin/xmax/ymax/cx/cy — merged bbox in detector pixel coords
+    #   cutout_x0/y0/x1/y1/cx/cy     — cutout window in detector pixel coords
+    #   local_xmin/ymin/xmax/ymax/cx/cy — bbox relative to cutout origin
+    #   zeroth_order                  — 1 if matched to ZO catalog, 0 otherwise
 
-    # fig, ax = plt.subplots(figsize=(10, 10))
-    # ax.imshow(cs_inpainted, origin='lower', cmap='gray', norm=norm_vis)
-    # ax.axis('off')
-    # ax.set_title(
-    #     f'DET{DET_CODE} — ZO matched: {len(zo_matched)}   unmatched: {len(unmatched)}',
-    #     fontsize=11
-    # )
-    # for obj in zo_matched:
-    #     xmin, ymin, xmax, ymax = bbox_of(obj)
-    #     ax.add_patch(plt.matplotlib.patches.Rectangle(
-    #         xy=(xmin - pad, ymin - pad),
-    #         width=(xmax - xmin) + 2 * pad, height=(ymax - ymin) + 2 * pad,
-    #         edgecolor='gold', facecolor='none', linewidth=1.3, linestyle='--'
-    #     ))
-    # for obj in unmatched:
-    #     xmin, ymin, xmax, ymax = bbox_of(obj)
-    #     ax.add_patch(plt.matplotlib.patches.Rectangle(
-    #         xy=(xmin - pad, ymin - pad),
-    #         width=(xmax - xmin) + 2 * pad, height=(ymax - ymin) + 2 * pad,
-    #         edgecolor='royalblue', facecolor='none', linewidth=0.7, linestyle='--'
-    #     ))
-    # plt.tight_layout()
-    # plt.savefig(f"{fits_id}_DET{DET_CODE}_zo.png", dpi=150, bbox_inches='tight')
-    # plt.close()
+    zo_matched_bboxes = {tuple(int(v) for v in o['bbox']) for o in zo_matched}
 
+    fits_basename = os.path.basename(fits_path)
+    rows = []
 
-    # # ── Build detection CSV ────────────────────────────────────────────────────
-    # # All coordinates are in the individual 2040×2040 detector pixel space.
-    # #
-    # # Columns:
-    # #   source_fits                   — original FITS basename (trace back to main file + detector)
-    # #   det_code                      — two-char detector code, e.g. "11"
-    # #   det_xmin/ymin/xmax/ymax/cx/cy — merged bbox in detector pixel coords
-    # #   cutout_x0/y0/x1/y1/cx/cy     — cutout window in detector pixel coords
-    # #   local_xmin/ymin/xmax/ymax/cx/cy — bbox relative to cutout origin
-    # #   zeroth_order                  — 1 if matched to ZO catalog, 0 otherwise
+    for obj in all_merged:
+        xmin, ymin, xmax, ymax = [int(v) for v in obj['bbox']]
+        if max(xmax - xmin, ymax - ymin) < TINY_MAX_DIM:
+            continue
 
-    # zo_matched_bboxes = {tuple(int(v) for v in o['bbox']) for o in zo_matched}
+        cx, cy   = (xmin + xmax) // 2, (ymin + ymax) // 2
+        bw, bh   = xmax - xmin, ymax - ymin
+        aspect   = bw / bh if bh > 0 else float('inf')
+        scale    = SCALE_ELONGATED if aspect > ELONGATED_THRESH else SCALE_COMPACT
+        half     = max(int(scale * max(bw, bh)) // 2, 20)
+        side     = 2 * half
+        x0 = int(np.clip(cx - half, 0, cs_inpainted.shape[1] - side))
+        y0 = int(np.clip(cy - half, 0, cs_inpainted.shape[0] - side))
 
-    # fits_basename = os.path.basename(fits_path)
-    # rows = []
+        lxmin = int(np.clip(xmin - x0, 0, side))
+        lymin = int(np.clip(ymin - y0, 0, side))
+        lxmax = int(np.clip(xmax - x0, 0, side))
+        lymax = int(np.clip(ymax - y0, 0, side))
+        lxmin_pad = max(0,    lxmin - BBOX_PAD)
+        lymin_pad = max(0,    lymin - BBOX_PAD)
+        lxmax_pad = min(side, lxmax + BBOX_PAD)
+        lymax_pad = min(side, lymax + BBOX_PAD)
 
-    # for obj in all_merged:
-    #     xmin, ymin, xmax, ymax = [int(v) for v in obj['bbox']]
-    #     if max(xmax - xmin, ymax - ymin) < TINY_MAX_DIM:
-    #         continue
+        rows.append({
+            'source_fits' : fits_basename,
+            'det_code'    : DET_CODE,
+            # merged bbox in detector pixel coords
+            'det_xmin'    : xmin,
+            'det_ymin'    : ymin,
+            'det_xmax'    : xmax,
+            'det_ymax'    : ymax,
+            'det_centerx'      : cx,
+            'det_centery'      : cy,
+            # cutout window in detector pixel coords
+            'cutout_x0'   : x0,
+            'cutout_y0'   : y0,
+            'cutout_x1'   : x0 + side,
+            'cutout_y1'   : y0 + side,
+            'cutout_centerx'   : x0 + side // 2,
+            'cutout_centery'   : y0 + side // 2,
+            # bbox relative to cutout origin (padded, matches _bbox.npy)
+            'local_xmin'  : lxmin_pad,
+            'local_ymin'  : lymin_pad,
+            'local_xmax'  : lxmax_pad,
+            'local_ymax'  : lymax_pad,
+            'local_centerx'    : (lxmin_pad + lxmax_pad) // 2,
+            'local_centery'    : (lymin_pad + lymax_pad) // 2,
+            # ZO match label
+            'zeroth_order': 1 if (xmin, ymin, xmax, ymax) in zo_matched_bboxes else 0,
+            'source_type' : 'dark' if (xmin, ymin, xmax, ymax) in dark_bbox_set else 'bright',
+            # stem links this row to its .npy cutout and SAM mask
+            'cutout_stem' : f"cutout_{fits_id}_DET{DET_CODE}_{xmin}_{xmax}_{ymin}_{ymax}",
+        })
 
-    #     cx, cy   = (xmin + xmax) // 2, (ymin + ymax) // 2
-    #     bw, bh   = xmax - xmin, ymax - ymin
-    #     aspect   = bw / bh if bh > 0 else float('inf')
-    #     scale    = SCALE_ELONGATED if aspect > ELONGATED_THRESH else SCALE_COMPACT
-    #     half     = max(int(scale * max(bw, bh)) // 2, 20)
-    #     side     = 2 * half
-    #     x0 = int(np.clip(cx - half, 0, cs_inpainted.shape[1] - side))
-    #     y0 = int(np.clip(cy - half, 0, cs_inpainted.shape[0] - side))
-
-    #     lxmin = int(np.clip(xmin - x0, 0, side))
-    #     lymin = int(np.clip(ymin - y0, 0, side))
-    #     lxmax = int(np.clip(xmax - x0, 0, side))
-    #     lymax = int(np.clip(ymax - y0, 0, side))
-    #     lxmin_pad = max(0,    lxmin - BBOX_PAD)
-    #     lymin_pad = max(0,    lymin - BBOX_PAD)
-    #     lxmax_pad = min(side, lxmax + BBOX_PAD)
-    #     lymax_pad = min(side, lymax + BBOX_PAD)
-
-    #     rows.append({
-    #         'source_fits' : fits_basename,
-    #         'det_code'    : DET_CODE,
-    #         # merged bbox in detector pixel coords
-    #         'det_xmin'    : xmin,
-    #         'det_ymin'    : ymin,
-    #         'det_xmax'    : xmax,
-    #         'det_ymax'    : ymax,
-    #         'det_centerx'      : cx,
-    #         'det_centery'      : cy,
-    #         # cutout window in detector pixel coords
-    #         'cutout_x0'   : x0,
-    #         'cutout_y0'   : y0,
-    #         'cutout_x1'   : x0 + side,
-    #         'cutout_y1'   : y0 + side,
-    #         'cutout_centerx'   : x0 + side // 2,
-    #         'cutout_centery'   : y0 + side // 2,
-    #         # bbox relative to cutout origin (padded, matches _bbox.npy)
-    #         'local_xmin'  : lxmin_pad,
-    #         'local_ymin'  : lymin_pad,
-    #         'local_xmax'  : lxmax_pad,
-    #         'local_ymax'  : lymax_pad,
-    #         'local_centerx'    : (lxmin_pad + lxmax_pad) // 2,
-    #         'local_centery'    : (lymin_pad + lymax_pad) // 2,
-    #         # ZO match label
-    #         'zeroth_order': 1 if (xmin, ymin, xmax, ymax) in zo_matched_bboxes else 0,
-    #         'source_type' : 'dark' if (xmin, ymin, xmax, ymax) in dark_bbox_set else 'bright',
-    #         # stem links this row to its .npy cutout and SAM mask
-    #         'cutout_stem' : f"cutout_{fits_id}_DET{DET_CODE}_{xmin}_{xmax}_{ymin}_{ymax}",
-    #     })
-
-    # df_det = pd.DataFrame(rows)
-    # out_csv = f"detections_{fits_id}_DET{DET_CODE}.csv"
-    # df_det.to_csv(out_csv, index=False)
-    # print(f"Saved {len(df_det)} rows → {out_csv}  "
-    #     f"(ZO matched: {df_det['zeroth_order'].sum()}, unmatched: {(df_det['zeroth_order']==0).sum()})")
+    df_det = pd.DataFrame(rows)
+    df_det.to_csv(out_csv, index=False)
+    print(f"Saved {len(df_det)} rows → {out_csv}  "
+        f"(ZO matched: {df_det['zeroth_order'].sum()}, unmatched: {(df_det['zeroth_order']==0).sum()})")

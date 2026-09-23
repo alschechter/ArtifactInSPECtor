@@ -56,7 +56,7 @@ def to_display(raw):
     normed = np.clip((raw - vmin) / (vmax - vmin + 1e-12), 0, 1)
     return np.nan_to_num(normed, nan=0.0)
     
-det_csvs = glob.glob('detections_*.csv')
+det_csvs = glob.glob('detections_*_DET*.csv')
 if len(det_csvs) != 1:
     raise FileNotFoundError(f"Expected exactly one detections_*.csv in {os.getcwd()}, found {det_csvs}")
 table = pd.read_csv(det_csvs[0])
