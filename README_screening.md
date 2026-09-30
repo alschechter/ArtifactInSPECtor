@@ -57,3 +57,18 @@ mask placed at cutout_x0/y0) back to detector pixels.
 
 Options: `--no-rotate` (cut out in the detector frame, old behaviour);
 `--dispersion-angle DEG` (use this angle instead of measuring it; alias `--mask-angle`).
+
+## Screening happens BEFORE merging (update)
+Every raw SEP detection (hot, cold and dark passes) is screened on its own, before the 30/10 px
+merge, so a spectrum can no longer be merged together with a nearby zeroth order or artifact into
+one large box:
+* dropped: detections that are only continuum and/or emission-line pixels (rules above). A compact
+  detection on a continuum is dropped too **unless** `compact_sources.npy` (every blob found by
+  euclid_mask, whatever its class) shows a round blob at least 4 px tall inside it -- e.g. a
+  zeroth order sitting on the spectrum. Short spectrum segments are 1-3 px tall and do not count.
+* split: a long detection that is >=80 % continuum but touches zeroth-order / artifact / snowball
+  pixels is replaced by compact boxes around those pixels (+5 px); the spectrum part is dropped
+  (`continuum_split` in the screened-out CSV, with `n_pieces_kept`).
+* everything else is kept and merged as before; all merged boxes go to SAM.
+`screened_out_<id>_DET<nn>.csv` now lists the raw detections (sep_pass, det bbox, area, reason).
+In the QA image red = merged boxes sent to SAM, orange/green = raw detections screened out.

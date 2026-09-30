@@ -26,8 +26,11 @@ DEFAULTS = dict(
 )
 
 
-def screen_box(bbox, label_map, **kw):
+def screen_box(bbox, label_map, compact=None, **kw):
     """bbox = (xmin, ymin, xmax, ymax) in detector pixels (same frame as label_map).
+    compact = optional compact_sources.npy map from euclid_mask (every blob, whatever its class):
+    used to decide whether a compact box on a continuum holds a real blob (e.g. a zeroth order
+    sitting on the spectrum) or is just a short piece of the spectrum itself.
     Returns (send_to_sam: bool, reason: str, fractions: dict)."""
     p = {**DEFAULTS, **kw}
     H, W = label_map.shape
@@ -54,9 +57,23 @@ def screen_box(bbox, label_map, **kw):
         w, h = xmax - xmin + 1, ymax - ymin + 1
         if max(w, h) / max(min(w, h), 1) >= p['cont_min_aspect']:
             return False, 'continuum', fr
-        return True, 'compact_on_continuum', fr
+        if compact is None or _has_round_blob(compact[y0:y1, x0:x1]):
+            return True, 'compact_on_continuum', fr
+        return False, 'continuum', fr        # a short piece of the spectrum, no blob on it
     return True, 'mixed_or_uncertain', fr
 
 
-def screen_boxes(boxes, label_map, **kw):
-    return [screen_box(b, label_map, **kw) for b in boxes]
+def _has_round_blob(sub, min_h=4):
+    """True if the compact-source map holds a blob at least min_h px tall and not stretched
+    along the rows (spectrum segments are 1-3 px tall)."""
+    from scipy import ndimage as ndi
+    lab, n = ndi.label(sub)
+    for sl in ndi.find_objects(lab):
+        h, w = sl[0].stop - sl[0].start, sl[1].stop - sl[1].start
+        if h >= min_h and w <= 2.5 * h + 2:
+            return True
+    return False
+
+
+def screen_boxes(boxes, label_map, compact=None, **kw):
+    return [screen_box(b, label_map, compact, **kw) for b in boxes]
