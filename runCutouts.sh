@@ -53,6 +53,6 @@ fi
 # One python call per FITS file, so the file, gelsa frame and ZO catalog are loaded once
 for fits_file in "${fits_files[@]}"; do
     echo "=== Processing $fits_file ${DET_ARG:+det $DET_ARG} ==="
-    python "$BASE_DIR/ArtifactInSPECtor/Cutouts_Pipeline.py" "$fits_file" "${DET_OPT[@]}" $FORCE_FLAG \
-        || echo "WARNING: Cutouts_Pipeline.py failed for $fits_file"
+    python "$BASE_DIR/ArtifactInSPECtor/Screen_Cutouts_Pipeline.py" "$fits_file" "${DET_OPT[@]}" $FORCE_FLAG \
+        || echo "WARNING: Screen_Cutouts_Pipeline.py failed for $fits_file"
 done

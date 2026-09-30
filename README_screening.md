@@ -2,7 +2,7 @@
 
 Drop-in additions to ArtifactInSPECtor so that only probable artifacts are cut out and sent to SAM.
 
-Copy `euclid_mask.py`, `artifact_screen.py` and the updated `Cutouts_Pipeline.py` / `runCutouts.sh`
+Copy `euclid_mask.py`, `artifact_screen.py` and the updated `Screen_Cutouts_Pipeline.py` / `runCutouts.sh`
 into the repo root (next to the existing scripts). Nothing else changes: `run_sam_minthresh.sh` and
 `runPreContSub.sh` run as before.
 
@@ -29,7 +29,7 @@ Extra Python packages: `opencv-python-headless`, `scikit-image` (scipy/numpy/pil
 5. QA image `<fits_id>_DET<nn>_screened.png`: red = to SAM, orange = screened out as continuum,
    green = screened out as emission line.
 
-## Options (Cutouts_Pipeline.py)
+## Options (Screen_Cutouts_Pipeline.py)
 * `--no-screen`          old behaviour, everything to SAM
 * `--mask-angle DEG`     force the dispersion angle instead of measuring it
 

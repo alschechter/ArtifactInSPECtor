@@ -20,19 +20,19 @@ module load python/3.10.10-gcc-13.1.0-ucftoxt
 source ~/envs/AISpector/bin/activate
 
 # Code and data folder: the directory you ran sbatch from (override with BASE_DIR=... sbatch ...).
-# Cutouts_Pipeline.py looks for calib/, Official-Roman-Artifact-Detection/ and writes <fits>/<det>/
+# Screen_Cutouts_Pipeline.py looks for calib/, Official-Roman-Artifact-Detection/ and writes <fits>/<det>/
 # next to itself, so the code must live in the same folder as the data.
 BASE_DIR=${BASE_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}
 cd "$BASE_DIR"
 echo "BASE_DIR = $BASE_DIR   (git branch: $(git branch --show-current 2>/dev/null || echo 'not a git repo'))"
 [ -d "$BASE_DIR/Euclid_Images" ] || { echo "ERROR: $BASE_DIR/Euclid_Images not found - run sbatch from the folder that holds the data"; exit 1; }
 
-# the new code must sit next to Cutouts_Pipeline.py in $BASE_DIR
-for f in Cutouts_Pipeline.py euclid_mask.py artifact_screen.py; do
+# the new code must sit next to Screen_Cutouts_Pipeline.py in $BASE_DIR
+for f in Screen_Cutouts_Pipeline.py euclid_mask.py artifact_screen.py; do
     [ -f "$BASE_DIR/$f" ] || { echo "ERROR: $BASE_DIR/$f not found - check out the sam-screening branch there or copy the file in"; exit 1; }
 done
-grep -q "artifact_screen" "$BASE_DIR/Cutouts_Pipeline.py" \
-  || { echo "ERROR: $BASE_DIR/Cutouts_Pipeline.py is the old version (no screening)"; exit 1; }
+grep -q "artifact_screen" "$BASE_DIR/Screen_Cutouts_Pipeline.py" \
+  || { echo "ERROR: $BASE_DIR/Screen_Cutouts_Pipeline.py is the old version (no screening)"; exit 1; }
 python -c "import cv2, skimage" \
   || { echo "ERROR: missing packages - run: pip install opencv-python-headless scikit-image"; exit 1; }
 
@@ -53,7 +53,7 @@ done
 mkdir -p "$target/sam_results_precontsub"     # PreContSub writes here and expects it to exist
 
 echo "=== Cutouts + screening: $fits_file det $DET -> $target ==="
-(cd "$target" && python "$BASE_DIR/Cutouts_Pipeline.py" "$fits_file" --det-code "$DET" --force)
+(cd "$target" && python "$BASE_DIR/Screen_Cutouts_Pipeline.py" "$fits_file" --det-code "$DET" --force)
 
 echo "=== Summary ==="
 cd "$target"

@@ -5,6 +5,7 @@ from PIL import Image, ImageDraw
 from astropy.visualization import simple_norm
 from astropy.io import fits
 from scipy.ndimage import uniform_filter
+from scipy import ndimage
 import sep
 import pandas as pd
 import gelsa
@@ -13,6 +14,9 @@ import glob
 import argparse
 from euclid_mask import Pipeline as MaskPipeline
 from artifact_screen import screen_box
+from dispersion_frame import DispersionFrame, refine_dispersion_angle
+import euclid_mask
+import json
 
 parser = argparse.ArgumentParser()
 parser.add_argument("fits_path", help="Path to the input FITS file")
@@ -29,8 +33,10 @@ parser.add_argument(
 )
 parser.add_argument("--no-screen", action="store_true",
                     help="Send every detection to SAM (skip the euclid_mask screening).")
-parser.add_argument("--mask-angle", type=float, default=None,
-                    help="Dispersion angle for euclid_mask in deg (default: measured from the image).")
+parser.add_argument("--dispersion-angle", "--mask-angle", dest="dispersion_angle", type=float, default=None,
+                    help="Dispersion angle in deg (detector frame, y down). Default: measured from the image.")
+parser.add_argument("--no-rotate", action="store_true",
+                    help="Cut out in the detector frame (old behaviour) instead of the dispersion frame.")
 args = parser.parse_args()
 fits_path = args.fits_path
 
@@ -447,24 +453,6 @@ for DET_CODE in det_codes_to_process:
     # ── Plot combined result ──────────────────────────────────────────────────
     pad = 5
     
-    hot_dicts   = sep_to_objlist(hot_final)
-    merged_hot  = merge_objects(hot_dicts,  h_proximity=30, v_proximity=10,
-                                elongated_thresh=3.0, compact_proximity_scale=1)
-    print(f"Hot before merge:  {len(hot_final):4d}   after: {len(merged_hot)}")
-
-    cold_dicts  = sep_to_objlist(cold_final)
-    merged_cold = merge_objects(cold_dicts, h_proximity=30, v_proximity=10,
-                                elongated_thresh=3.0, compact_proximity_scale=1)
-    print(f"Cold before merge: {len(cold_final):4d}   after: {len(merged_cold)}")
-
-    dark_dicts  = sep_to_objlist(dark_objs)
-    merged_dark = merge_objects(dark_dicts, h_proximity=30, v_proximity=10,
-                                elongated_thresh=3.0, compact_proximity_scale=1)
-    merged_dark = [o for o in merged_dark if o['area'] > DARK_MIN_AREA]
-    print(f"Dark before merge: {len(dark_objs):4d}   after: {len(merged_dark)} (area > {DARK_MIN_AREA})")
-
-    all_merged = merged_cold + merged_hot + merged_dark
-
     norm_vis = simple_norm(cs_inpainted, stretch='asinh', min_percent=1, max_percent=99)
 
     # Write the array straight to a raster via imsave — no Figure/Axes, no dpi,
@@ -483,6 +471,88 @@ for DET_CODE in det_codes_to_process:
     os.makedirs(noboxes_dir, exist_ok=True)
     noboxes_path = os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_noboxes.png")
     plt.imsave(noboxes_path, rgba, origin='upper')
+
+    # ── Screen individual SEP detections BEFORE merging ────────────────────────
+    # The mask code runs on the pixel-exact noboxes PNG (detector coordinates). Each raw
+    # SEP detection is screened on its own; detections that are confidently only
+    # continuum and/or emission-line pixels are dropped here, so a long spectrum can no
+    # longer be merged together with a nearby zeroth order / artifact into one big box.
+    # Everything else (zeroth orders, stars, snowballs, ghosts, trails, other artifacts,
+    # unclassified, mixed) is kept and merged as before.
+    screened_out = []
+    if not args.no_screen:
+        mask_dir = os.path.join(noboxes_dir, 'euclid_masks')
+        MaskPipeline(noboxes_path, mask_dir, angle=args.dispersion_angle).run()
+        label_map = np.load(os.path.join(mask_dir, 'label_map.npy'))
+        compact_map = np.load(os.path.join(mask_dir, 'compact_sources.npy'))
+
+        H_lm, W_lm = label_map.shape
+        keep_cls = np.isin(label_map, (1, 4, 5))        # zeroth order, artifact, snowball
+
+        def _sub_obj(x0, y0, x1, y1, npix):
+            w, h = float(x1 - x0), float(y1 - y0)
+            return {'bbox': [float(x0), float(y0), float(x1), float(y1)],
+                    'centroid': [(x0 + x1) / 2.0, (y0 + y1) / 2.0], 'area': float(npix),
+                    'width': w, 'height': h, 'aspect_ratio': w / h if h > 0 else float('inf'),
+                    'fill_ratio': npix / (w * h) if w * h > 0 else 0.0, 'label': 0}
+
+        def prescreen(dicts, kind, margin=5):
+            kept = []
+            for o in dicts:
+                key = tuple(int(round(v)) for v in o['bbox'])
+                send, reason, fr = screen_box(key, label_map, compact_map)
+                if not send:
+                    screened_out.append({'kind': kind, 'bbox': key, 'reason': reason, 'fr': fr,
+                                         'area': o['area']})
+                    continue
+                xmin, ymin, xmax, ymax = key
+                w, h = xmax - xmin, ymax - ymin
+                # A detection that is mostly spectrum but touches a zeroth order / artifact /
+                # snowball: keep only compact boxes around those pixels, drop the spectrum part.
+                if fr['continuum'] >= 0.8 and max(w, h) >= 3 * max(min(w, h), 1) and max(w, h) >= 60:
+                    sub = keep_cls[max(0, ymin - 2):min(H_lm, ymax + 3), max(0, xmin - 2):min(W_lm, xmax + 3)]
+                    lab_s, n_s = ndimage.label(sub, structure=np.ones((3, 3)))
+                    pieces = []
+                    for sl in ndimage.find_objects(lab_s):
+                        if sl is None: continue
+                        y0 = max(0, ymin - 2) + sl[0].start - margin; y1 = max(0, ymin - 2) + sl[0].stop + margin
+                        x0 = max(0, xmin - 2) + sl[1].start - margin; x1 = max(0, xmin - 2) + sl[1].stop + margin
+                        pieces.append(_sub_obj(max(0, x0), max(0, y0), min(W_lm - 1, x1), min(H_lm - 1, y1),
+                                               int((lab_s[sl] > 0).sum())))
+                    if pieces:
+                        kept.extend(pieces)
+                        screened_out.append({'kind': kind, 'bbox': key, 'reason': 'continuum_split',
+                                             'fr': fr, 'area': o['area'], 'n_pieces_kept': len(pieces)})
+                        continue
+                kept.append(o)
+            return kept
+
+    hot_dicts   = sep_to_objlist(hot_final)
+    cold_dicts  = sep_to_objlist(cold_final)
+    dark_dicts  = sep_to_objlist(dark_objs)
+    if not args.no_screen:
+        n_raw = len(hot_dicts) + len(cold_dicts) + len(dark_dicts)
+        hot_dicts  = prescreen(hot_dicts,  'hot')
+        cold_dicts = prescreen(cold_dicts, 'cold')
+        dark_dicts = prescreen(dark_dicts, 'dark')
+        print(f"Screening before merge: dropped {len(screened_out)} / {n_raw} raw detections "
+              f"(continuum/emission only)")
+
+    merged_hot  = merge_objects(hot_dicts,  h_proximity=30, v_proximity=10,
+                                elongated_thresh=3.0, compact_proximity_scale=1)
+    print(f"Hot before merge:  {len(hot_dicts):4d}   after: {len(merged_hot)}")
+
+    merged_cold = merge_objects(cold_dicts, h_proximity=30, v_proximity=10,
+                                elongated_thresh=3.0, compact_proximity_scale=1)
+    print(f"Cold before merge: {len(cold_dicts):4d}   after: {len(merged_cold)}")
+
+    merged_dark = merge_objects(dark_dicts, h_proximity=30, v_proximity=10,
+                                elongated_thresh=3.0, compact_proximity_scale=1)
+    merged_dark = [o for o in merged_dark if o['area'] > DARK_MIN_AREA]
+    print(f"Dark before merge: {len(dark_dicts):4d}   after: {len(merged_dark)} (area > {DARK_MIN_AREA})")
+
+    all_merged = merged_cold + merged_hot + merged_dark
+
 
     # Draw detection boxes (same pixel coordinates that go into the detections CSV)
     # directly in pixel space with PIL — also no resampling — onto a second,
@@ -541,32 +611,67 @@ for DET_CODE in det_codes_to_process:
 
     zo_matched_bboxes = {tuple(int(v) for v in o['bbox']) for o in zo_matched}
 
-    # ── Screen detections with euclid_mask ─────────────────────────────────────
-    # The mask code runs on the same pixel-exact noboxes PNG, so its label map is in
-    # detector pixel coordinates. Everything goes to SAM except boxes that are
-    # confidently only emission-line and/or continuum pixels (no zeroth-order, star,
-    # snowball, ghost, trail or other artifact pixels).
+    # ── Describe the merged boxes (all of them go to SAM) and write the QA image ──
     screen = {}
     if not args.no_screen:
-        mask_dir = os.path.join(noboxes_dir, 'euclid_masks')
-        MaskPipeline(noboxes_path, mask_dir, angle=args.mask_angle).run()
-        label_map = np.load(os.path.join(mask_dir, 'label_map.npy'))
         for obj in all_merged:
             key = tuple(int(v) for v in obj['bbox'])
-            screen[key] = screen_box(key, label_map)
-        n_send = sum(s[0] for s in screen.values())
-        print(f"Screening: {n_send} / {len(screen)} detections sent to SAM")
-        # QA image: red = sent to SAM, orange = screened out as continuum, green = as emission line
+            screen[key] = screen_box(key, label_map, compact_map)      # class fractions / dominant class, for the CSV
+        # QA image: red = merged box sent to SAM; orange / green = raw detection screened out
+        # before merging as continuum / emission line
         qa = Image.open(noboxes_path).convert('RGB'); qd = ImageDraw.Draw(qa)
-        qcol = {'continuum': (255, 160, 0), 'emission_line': (60, 255, 60)}
-        for key, (send, reason, _) in screen.items():
+        qcol = {'continuum': (255, 160, 0), 'emission_line': (60, 255, 60), 'continuum_split': (255, 160, 0)}
+        for so in screened_out:
+            xmin, ymin, xmax, ymax = so['bbox']
+            qd.rectangle([xmin - pad, ymin - pad, xmax + pad, ymax + pad], outline=qcol[so['reason']], width=1)
+        for key in screen:
             xmin, ymin, xmax, ymax = key
-            qd.rectangle([xmin - pad, ymin - pad, xmax + pad, ymax + pad],
-                         outline=(255, 0, 0) if send else qcol[reason], width=1)
+            qd.rectangle([xmin - pad, ymin - pad, xmax + pad, ymax + pad], outline=(255, 0, 0), width=1)
         qa.save(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_screened.png"))
 
     def sent_to_sam(bbox):
-        return True if args.no_screen else screen[tuple(int(v) for v in bbox)][0]
+        return True          # screening already happened before merging
+
+
+    # ── Dispersion frame: cutouts with the spectra exactly along rows ──────────
+    # Quarter turns are exact (np.rot90); the residual grism tilt is removed by moving
+    # whole detector columns up/down by an integer number of pixels (column shear).
+    # No pixel value is interpolated: every cutout pixel is an original detector pixel.
+    if args.no_rotate:
+        frame = DispersionFrame(cs_inpainted.shape, 0.0); angle_info = {'method': 'none (--no-rotate)'}
+    else:
+        if args.dispersion_angle is not None:
+            disp_angle, angle_info = args.dispersion_angle, {'method': 'user'}
+        else:
+            png_gray = np.array(Image.open(noboxes_path).convert('L')).astype(np.float32)
+            if not args.no_screen:
+                coarse = json.load(open(os.path.join(mask_dir, 'run_info.json')))['dispersion_angle_deg']
+                disp_angle, n_st, scat = refine_dispersion_angle(png_gray, label_map, coarse)
+                angle_info = {'method': 'refined on continuum residuals', 'coarse_deg': coarse,
+                              'n_streaks': n_st, 'streak_scatter_deg': scat}
+            else:
+                med = np.median(png_gray); sig = 1.4826 * np.median(np.abs(png_gray - med))
+                z = np.minimum(np.abs(png_gray - med) / sig, 6.0).astype(np.float32)
+                disp_angle = euclid_mask.find_dispersion(z, np.ones(z.shape, bool))[0]
+                angle_info = {'method': 'coarse (screening off)'}
+        frame = DispersionFrame(cs_inpainted.shape, disp_angle)
+        angle_info['dispersion_angle_deg'] = float(disp_angle)
+    frame_info = {**frame.describe(), **angle_info}
+    print(f"Dispersion frame: {frame_info}")
+    with open(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_dispersion_frame.json"), 'w') as fh:
+        json.dump(frame_info, fh, indent=1)
+    cs_frame  = frame.forward(cs_inpainted.astype(np.float32), fill=0.0)
+    pre_frame = frame.forward(sci_masked.astype(np.float32), fill=float(np.nanmedian(sci_masked)))
+    if not args.no_rotate:
+        plt.imsave(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_dispersion_frame.png"),
+                   norm_vis(np.nan_to_num(cs_frame)), cmap='gray', origin='upper')
+
+    def to_frame_box(b):
+        fx0, fy0, fx1, fy1 = frame.box_to_frame(b['xmin'], b['ymin'], b['xmax'], b['ymax'])
+        cx_, cy_ = (frame.to_frame(np.array([c[0] for c in b['centers']]),
+                                   np.array([c[1] for c in b['centers']])) if len(b['centers']) else ([], []))
+        return {**b, 'xmin': fx0, 'ymin': fy0, 'xmax': fx1, 'ymax': fy1,
+                'centers': list(zip(np.atleast_1d(cx_).tolist(), np.atleast_1d(cy_).tolist()))}
 
     # ---------- Cutouts ----------
 
@@ -587,11 +692,12 @@ for DET_CODE in det_codes_to_process:
     print(f"Normal: {len(normal_boxes)}   Tiny (< {TINY_MAX_DIM} px): {len(tiny_boxes)}")
 
 
-    cutouts            = [make_cutout(b, cs_inpainted) for b in normal_boxes]
-    cutouts_precontsub = [make_cutout(b, sci_masked)   for b in normal_boxes]
+    frame_boxes        = [to_frame_box(b) for b in normal_boxes]
+    cutouts            = [make_cutout(fb, cs_frame)  for fb in frame_boxes]
+    cutouts_precontsub = [make_cutout(fb, pre_frame) for fb in frame_boxes]
 
-    for box, (cutout, lxmin, lymin, lxmax, lymax, crop_x0, crop_y0), (precontsub, *_) in zip(normal_boxes, cutouts, cutouts_precontsub):
-        x0, y0 = box['xmin'], box['ymin']
+    for box, fbox, (cutout, lxmin, lymin, lxmax, lymax, crop_x0, crop_y0), (precontsub, *_) in zip(normal_boxes, frame_boxes, cutouts, cutouts_precontsub):
+        x0, y0 = box['xmin'], box['ymin']          # stem keeps detector coordinates
         x1, y1 = box['xmax'], box['ymax']
         h_co, w_co = cutout.shape
         lxmin_pad = max(0,    lxmin - BBOX_PAD)
@@ -604,7 +710,7 @@ for DET_CODE in det_codes_to_process:
         np.save(os.path.join(CUTOUT_DIR, f"{stem}_bbox.npy"),
                 np.array([lxmin_pad, lymin_pad, lxmax_pad, lymax_pad], dtype=np.float32))
         local_centers = np.array(
-            [[cx - crop_x0, cy - crop_y0] for cx, cy in box['centers']], dtype=np.float32)
+            [[cx - crop_x0, cy - crop_y0] for cx, cy in fbox['centers']], dtype=np.float32)
         np.save(os.path.join(CUTOUT_DIR, f"{stem}_points.npy"), local_centers)
         if box.get('source_type') == 'dark':
             np.save(os.path.join(CUTOUT_DIR, f"{stem}_dark.npy"), np.array(True))
@@ -612,7 +718,8 @@ for DET_CODE in det_codes_to_process:
 
 
     # ── Build detection CSV ────────────────────────────────────────────────────
-    # All coordinates are in the individual detector's own pixel space.
+    # det_* coordinates are in the detector's own pixel space; frame_* and cutout_*/local_*
+    # coordinates are in the dispersion frame the cutouts were taken from (see *_dispersion_frame.json).
     #
     # Columns:
     #   source_fits                   — original FITS basename (trace back to main file + detector)
@@ -631,18 +738,21 @@ for DET_CODE in det_codes_to_process:
             continue
 
         cx, cy   = (xmin + xmax) // 2, (ymin + ymax) // 2
-        bw, bh   = xmax - xmin, ymax - ymin
+        # cutout geometry is computed in the dispersion frame (same as make_cutout)
+        fxmin, fymin, fxmax, fymax = frame.box_to_frame(xmin, ymin, xmax, ymax)
+        fcx, fcy = (fxmin + fxmax) // 2, (fymin + fymax) // 2
+        bw, bh   = fxmax - fxmin, fymax - fymin
         aspect   = bw / bh if bh > 0 else float('inf')
         scale    = SCALE_ELONGATED if aspect > ELONGATED_THRESH else SCALE_COMPACT
         half     = max(int(scale * max(bw, bh)) // 2, 20)
         side     = 2 * half
-        x0 = int(np.clip(cx - half, 0, cs_inpainted.shape[1] - side))
-        y0 = int(np.clip(cy - half, 0, cs_inpainted.shape[0] - side))
+        x0 = int(np.clip(fcx - half, 0, cs_frame.shape[1] - side))
+        y0 = int(np.clip(fcy - half, 0, cs_frame.shape[0] - side))
 
-        lxmin = int(np.clip(xmin - x0, 0, side))
-        lymin = int(np.clip(ymin - y0, 0, side))
-        lxmax = int(np.clip(xmax - x0, 0, side))
-        lymax = int(np.clip(ymax - y0, 0, side))
+        lxmin = int(np.clip(fxmin - x0, 0, side))
+        lymin = int(np.clip(fymin - y0, 0, side))
+        lxmax = int(np.clip(fxmax - x0, 0, side))
+        lymax = int(np.clip(fymax - y0, 0, side))
         lxmin_pad = max(0,    lxmin - BBOX_PAD)
         lymin_pad = max(0,    lymin - BBOX_PAD)
         lxmax_pad = min(side, lxmax + BBOX_PAD)
@@ -658,7 +768,13 @@ for DET_CODE in det_codes_to_process:
             'det_ymax'    : ymax,
             'det_centerx'      : cx,
             'det_centery'      : cy,
-            # cutout window in detector pixel coords
+            # merged bbox in the dispersion frame
+            'frame_xmin'  : fxmin,
+            'frame_ymin'  : fymin,
+            'frame_xmax'  : fxmax,
+            'frame_ymax'  : fymax,
+            # cutout window in DISPERSION-FRAME pixel coords (see *_dispersion_frame.json;
+            # dispersion_frame.DispersionFrame(...).to_detector maps back to the detector)
             'cutout_x0'   : x0,
             'cutout_y0'   : y0,
             'cutout_x1'   : x0 + side,
@@ -677,9 +793,13 @@ for DET_CODE in det_codes_to_process:
             'source_type' : 'dark' if (xmin, ymin, xmax, ymax) in dark_bbox_set else 'bright',
             # stem links this row to its .npy cutout and SAM mask
             'cutout_stem' : f"cutout_{fits_id}_DET{DET_CODE}_{xmin}_{xmax}_{ymin}_{ymax}",
+            'frame_angle_deg' : round(frame_info.get('dispersion_angle_deg', 0.0), 4),
+            'frame_k90'       : frame.k90,
+            'frame_shear_tan' : round(frame.t, 8),
+            'frame_pad'       : frame.pad,
             **({} if args.no_screen else {
-                'sent_to_sam'     : int(screen[(xmin, ymin, xmax, ymax)][0]),
-                'screen_reason'   : screen[(xmin, ymin, xmax, ymax)][1],
+                'sent_to_sam'     : 1,
+                'screen_reason'   : screen[(xmin, ymin, xmax, ymax)][1],   # dominant class in the merged box
                 **{f'frac_{k}': round(v, 3) for k, v in screen[(xmin, ymin, xmax, ymax)][2].items()},
             }),
         })
@@ -690,8 +810,13 @@ for DET_CODE in det_codes_to_process:
     else:
         # the main CSV keeps only SAM-bound rows so the SAM / PreContSub steps run unchanged;
         # screened-out rows are kept separately (name does not match detections_*_DET*.csv)
-        df_det = df_all[df_all['sent_to_sam'] == 1]
-        df_all[df_all['sent_to_sam'] == 0].to_csv(f"screened_out_{fits_id}_DET{DET_CODE}.csv", index=False)
+        df_det = df_all
+        pd.DataFrame([{'source_fits': fits_basename, 'det_code': DET_CODE, 'sep_pass': so['kind'],
+                       'det_xmin': so['bbox'][0], 'det_ymin': so['bbox'][1],
+                       'det_xmax': so['bbox'][2], 'det_ymax': so['bbox'][3], 'area_pix': so['area'],
+                       'screen_reason': so['reason'], 'n_pieces_kept': so.get('n_pieces_kept', 0),
+                       **{f'frac_{k}': round(v, 3) for k, v in so['fr'].items()}}
+                      for so in screened_out]).to_csv(f"screened_out_{fits_id}_DET{DET_CODE}.csv", index=False)
     df_det.to_csv(out_csv, index=False)
     print(f"Saved {len(df_det)} rows → {out_csv}  "
         f"(ZO matched: {df_det['zeroth_order'].sum()}, unmatched: {(df_det['zeroth_order']==0).sum()})")

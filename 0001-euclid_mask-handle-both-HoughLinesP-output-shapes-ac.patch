@@ -1,0 +1,59 @@
+From 1356677e362add1630587ea47454fe21b048d409 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 30 Sep 2026 19:44:25 +0000
+Subject: [PATCH] euclid_mask: handle both HoughLinesP output shapes across
+ OpenCV versions; silence expected empty-slice warnings
+
+---
+ euclid_mask.py | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/euclid_mask.py b/euclid_mask.py
+index ecf360c..65b16d3 100644
+--- a/euclid_mask.py
++++ b/euclid_mask.py
+@@ -19,7 +19,7 @@ column pattern, 5 extended/dipole residual, 6 compact artifact on the above.
+ 
+ Usage:  python euclid_mask.py IMAGE.png --out OUTDIR [--angle DEG] [--em-max 60] [--cont-min-len 40]
+ """
+-import argparse, json, os, csv, time
++import argparse, json, os, csv, time, warnings
+ import numpy as np, cv2
+ from PIL import Image, ImageDraw, ImageFont
+ from scipy import ndimage as ndi
+@@ -27,6 +27,10 @@ from scipy.spatial import cKDTree
+ from skimage.filters import apply_hysteresis_threshold as hyst, sato
+ from skimage.morphology import remove_small_objects, skeletonize
+ 
++# rays that leave the image give empty/all-NaN slices; that is expected and handled
++warnings.filterwarnings('ignore', message='Mean of empty slice')
++warnings.filterwarnings('ignore', message='All-NaN slice encountered')
++
+ E = lambda n: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (n, n))
+ def mad(x): x = x[np.isfinite(x)]; m = np.median(x); return m, 1.4826 * np.median(np.abs(x - m)) + 1e-9
+ def keep_big(m, n):
+@@ -317,7 +321,9 @@ class Pipeline:
+                 y = np.round(c[1] + rs * np.sin(t) + o * np.cos(t)).astype(int)
+                 ok = (x >= 0) & (x < self.W) & (y >= 0) & (y < self.H)
+                 vv = np.full(len(rs), np.nan); vv[ok] = f[y[ok], x[ok]]; v.append(vv)
+-            return np.nanmean(np.array(v), 0)
++            with np.errstate(all='ignore'), warnings.catch_warnings():
++                warnings.simplefilter('ignore', RuntimeWarning)
++                return np.nanmean(np.array(v), 0)
+         angs = np.arange(0, 360, 1.0)
+         prof = {}
+         for c in cands:
+@@ -430,7 +436,9 @@ class Pipeline:
+         bright = (self.s12 > 3.0 * self.sn12) & self.valid & ~self.star_mask
+         L = cv2.HoughLinesP(bright.astype(np.uint8) * 255, 1, np.pi / 720, 50, minLineLength=120, maxLineGap=30)
+         hl = np.zeros(bright.shape, np.uint8); nh = 0
+-        for x1, y1, x2, y2 in (L[:, 0] if L is not None else []):
++        # OpenCV returns (N,1,4) in most versions but (N,4) in some: normalise the shape
++        segs = np.asarray(L).reshape(-1, 4) if L is not None else np.zeros((0, 4), int)
++        for x1, y1, x2, y2 in segs:
+             ang = np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180; d = min(ang, 180 - ang)
+             if d < 1.5 or abs(ang - 90) < 1.5: continue                   # along dispersion / columns: other steps
+             n_ = int(np.hypot(x2 - x1, y2 - y1)); xs_ = np.linspace(x1, x2, n_).astype(int); ys_ = np.linspace(y1, y2, n_).astype(int)
+-- 
+2.43.0
+
