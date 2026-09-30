@@ -11,6 +11,8 @@ import gelsa
 from astropy.convolution import Gaussian2DKernel
 import glob
 import argparse
+from euclid_mask import Pipeline as MaskPipeline
+from artifact_screen import screen_box
 
 parser = argparse.ArgumentParser()
 parser.add_argument("fits_path", help="Path to the input FITS file")
@@ -25,6 +27,10 @@ parser.add_argument(
     action="store_true",
     help="Reprocess a detector even if its detections CSV already exists.",
 )
+parser.add_argument("--no-screen", action="store_true",
+                    help="Send every detection to SAM (skip the euclid_mask screening).")
+parser.add_argument("--mask-angle", type=float, default=None,
+                    help="Dispersion angle for euclid_mask in deg (default: measured from the image).")
 args = parser.parse_args()
 fits_path = args.fits_path
 
@@ -492,47 +498,6 @@ for DET_CODE in det_codes_to_process:
         )
     boxed.save(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}.png"))
 
-    # ---------- Cutouts ----------
-
-    dark_bbox_set = {tuple(int(v) for v in o['bbox']) for o in merged_dark}
-    all_boxes = [
-        {'xmin': int(o['bbox'][0]), 'ymin': int(o['bbox'][1]),
-         'xmax': int(o['bbox'][2]), 'ymax': int(o['bbox'][3]),
-         'source_type': 'dark' if tuple(int(v) for v in o['bbox']) in dark_bbox_set else 'bright',
-         'centers': o['sub_centroids']}
-        for o in all_merged
-    ]
-
-    normal_boxes = [b for b in all_boxes
-                if max(b['xmax'] - b['xmin'], b['ymax'] - b['ymin']) >= TINY_MAX_DIM]
-    tiny_boxes   = [b for b in all_boxes
-                    if max(b['xmax'] - b['xmin'], b['ymax'] - b['ymin']) <  TINY_MAX_DIM]
-    print(f"Normal: {len(normal_boxes)}   Tiny (< {TINY_MAX_DIM} px): {len(tiny_boxes)}")
-
-
-    cutouts            = [make_cutout(b, cs_inpainted) for b in normal_boxes]
-    cutouts_precontsub = [make_cutout(b, sci_masked)   for b in normal_boxes]
-
-    for box, (cutout, lxmin, lymin, lxmax, lymax, crop_x0, crop_y0), (precontsub, *_) in zip(normal_boxes, cutouts, cutouts_precontsub):
-        x0, y0 = box['xmin'], box['ymin']
-        x1, y1 = box['xmax'], box['ymax']
-        h_co, w_co = cutout.shape
-        lxmin_pad = max(0,    lxmin - BBOX_PAD)
-        lymin_pad = max(0,    lymin - BBOX_PAD)
-        lxmax_pad = min(w_co, lxmax + BBOX_PAD)
-        lymax_pad = min(h_co, lymax + BBOX_PAD)
-        stem = f"cutout_{fits_id}_DET{DET_CODE}_{x0}_{x1}_{y0}_{y1}"
-        np.save(os.path.join(CUTOUT_DIR, f"{stem}.npy"),            cutout.astype(np.float32))
-        np.save(os.path.join(CUTOUT_DIR, f"{stem}_precontsub.npy"), precontsub.astype(np.float32))
-        np.save(os.path.join(CUTOUT_DIR, f"{stem}_bbox.npy"),
-                np.array([lxmin_pad, lymin_pad, lxmax_pad, lymax_pad], dtype=np.float32))
-        local_centers = np.array(
-            [[cx - crop_x0, cy - crop_y0] for cx, cy in box['centers']], dtype=np.float32)
-        np.save(os.path.join(CUTOUT_DIR, f"{stem}_points.npy"), local_centers)
-        if box.get('source_type') == 'dark':
-            np.save(os.path.join(CUTOUT_DIR, f"{stem}_dark.npy"), np.array(True))
-
-
     on_frame = zo_det >= 0
     print(f"On this FITS frame: {on_frame.sum():,} / {len(zo_table):,}")
 
@@ -574,6 +539,78 @@ for DET_CODE in det_codes_to_process:
 
     print(f"ZO matched: {len(zo_matched)}   Unmatched: {len(unmatched)}")
 
+    zo_matched_bboxes = {tuple(int(v) for v in o['bbox']) for o in zo_matched}
+
+    # ── Screen detections with euclid_mask ─────────────────────────────────────
+    # The mask code runs on the same pixel-exact noboxes PNG, so its label map is in
+    # detector pixel coordinates. Everything goes to SAM except boxes that are
+    # confidently only emission-line and/or continuum pixels (no zeroth-order, star,
+    # snowball, ghost, trail or other artifact pixels).
+    screen = {}
+    if not args.no_screen:
+        mask_dir = os.path.join(noboxes_dir, 'euclid_masks')
+        MaskPipeline(noboxes_path, mask_dir, angle=args.mask_angle).run()
+        label_map = np.load(os.path.join(mask_dir, 'label_map.npy'))
+        for obj in all_merged:
+            key = tuple(int(v) for v in obj['bbox'])
+            screen[key] = screen_box(key, label_map)
+        n_send = sum(s[0] for s in screen.values())
+        print(f"Screening: {n_send} / {len(screen)} detections sent to SAM")
+        # QA image: red = sent to SAM, orange = screened out as continuum, green = as emission line
+        qa = Image.open(noboxes_path).convert('RGB'); qd = ImageDraw.Draw(qa)
+        qcol = {'continuum': (255, 160, 0), 'emission_line': (60, 255, 60)}
+        for key, (send, reason, _) in screen.items():
+            xmin, ymin, xmax, ymax = key
+            qd.rectangle([xmin - pad, ymin - pad, xmax + pad, ymax + pad],
+                         outline=(255, 0, 0) if send else qcol[reason], width=1)
+        qa.save(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_screened.png"))
+
+    def sent_to_sam(bbox):
+        return True if args.no_screen else screen[tuple(int(v) for v in bbox)][0]
+
+    # ---------- Cutouts ----------
+
+    dark_bbox_set = {tuple(int(v) for v in o['bbox']) for o in merged_dark}
+    all_boxes = [
+        {'xmin': int(o['bbox'][0]), 'ymin': int(o['bbox'][1]),
+         'xmax': int(o['bbox'][2]), 'ymax': int(o['bbox'][3]),
+         'source_type': 'dark' if tuple(int(v) for v in o['bbox']) in dark_bbox_set else 'bright',
+         'centers': o['sub_centroids']}
+        for o in all_merged
+    ]
+
+    normal_boxes = [b for b in all_boxes
+                if max(b['xmax'] - b['xmin'], b['ymax'] - b['ymin']) >= TINY_MAX_DIM
+                and sent_to_sam((b['xmin'], b['ymin'], b['xmax'], b['ymax']))]
+    tiny_boxes   = [b for b in all_boxes
+                    if max(b['xmax'] - b['xmin'], b['ymax'] - b['ymin']) <  TINY_MAX_DIM]
+    print(f"Normal: {len(normal_boxes)}   Tiny (< {TINY_MAX_DIM} px): {len(tiny_boxes)}")
+
+
+    cutouts            = [make_cutout(b, cs_inpainted) for b in normal_boxes]
+    cutouts_precontsub = [make_cutout(b, sci_masked)   for b in normal_boxes]
+
+    for box, (cutout, lxmin, lymin, lxmax, lymax, crop_x0, crop_y0), (precontsub, *_) in zip(normal_boxes, cutouts, cutouts_precontsub):
+        x0, y0 = box['xmin'], box['ymin']
+        x1, y1 = box['xmax'], box['ymax']
+        h_co, w_co = cutout.shape
+        lxmin_pad = max(0,    lxmin - BBOX_PAD)
+        lymin_pad = max(0,    lymin - BBOX_PAD)
+        lxmax_pad = min(w_co, lxmax + BBOX_PAD)
+        lymax_pad = min(h_co, lymax + BBOX_PAD)
+        stem = f"cutout_{fits_id}_DET{DET_CODE}_{x0}_{x1}_{y0}_{y1}"
+        np.save(os.path.join(CUTOUT_DIR, f"{stem}.npy"),            cutout.astype(np.float32))
+        np.save(os.path.join(CUTOUT_DIR, f"{stem}_precontsub.npy"), precontsub.astype(np.float32))
+        np.save(os.path.join(CUTOUT_DIR, f"{stem}_bbox.npy"),
+                np.array([lxmin_pad, lymin_pad, lxmax_pad, lymax_pad], dtype=np.float32))
+        local_centers = np.array(
+            [[cx - crop_x0, cy - crop_y0] for cx, cy in box['centers']], dtype=np.float32)
+        np.save(os.path.join(CUTOUT_DIR, f"{stem}_points.npy"), local_centers)
+        if box.get('source_type') == 'dark':
+            np.save(os.path.join(CUTOUT_DIR, f"{stem}_dark.npy"), np.array(True))
+
+
+
     # ── Build detection CSV ────────────────────────────────────────────────────
     # All coordinates are in the individual detector's own pixel space.
     #
@@ -584,8 +621,6 @@ for DET_CODE in det_codes_to_process:
     #   cutout_x0/y0/x1/y1/cx/cy     — cutout window in detector pixel coords
     #   local_xmin/ymin/xmax/ymax/cx/cy — bbox relative to cutout origin
     #   zeroth_order                  — 1 if matched to ZO catalog, 0 otherwise
-
-    zo_matched_bboxes = {tuple(int(v) for v in o['bbox']) for o in zo_matched}
 
     fits_basename = os.path.basename(fits_path)
     rows = []
@@ -642,9 +677,21 @@ for DET_CODE in det_codes_to_process:
             'source_type' : 'dark' if (xmin, ymin, xmax, ymax) in dark_bbox_set else 'bright',
             # stem links this row to its .npy cutout and SAM mask
             'cutout_stem' : f"cutout_{fits_id}_DET{DET_CODE}_{xmin}_{xmax}_{ymin}_{ymax}",
+            **({} if args.no_screen else {
+                'sent_to_sam'     : int(screen[(xmin, ymin, xmax, ymax)][0]),
+                'screen_reason'   : screen[(xmin, ymin, xmax, ymax)][1],
+                **{f'frac_{k}': round(v, 3) for k, v in screen[(xmin, ymin, xmax, ymax)][2].items()},
+            }),
         })
 
-    df_det = pd.DataFrame(rows)
+    df_all = pd.DataFrame(rows)
+    if args.no_screen or df_all.empty:
+        df_det = df_all
+    else:
+        # the main CSV keeps only SAM-bound rows so the SAM / PreContSub steps run unchanged;
+        # screened-out rows are kept separately (name does not match detections_*_DET*.csv)
+        df_det = df_all[df_all['sent_to_sam'] == 1]
+        df_all[df_all['sent_to_sam'] == 0].to_csv(f"screened_out_{fits_id}_DET{DET_CODE}.csv", index=False)
     df_det.to_csv(out_csv, index=False)
     print(f"Saved {len(df_det)} rows → {out_csv}  "
         f"(ZO matched: {df_det['zeroth_order'].sum()}, unmatched: {(df_det['zeroth_order']==0).sum()})")
