@@ -671,6 +671,8 @@ class Pipeline:
         comb = lm > 0; np.save(f'{o}/combined_mask.npy', comb); Image.fromarray((comb * 255).astype(np.uint8)).save(f'{o}/combined_mask.png')
         np.save(f'{o}/label_map.npy', lm); np.save(f'{o}/artifact_type_map.npy', self.art_type)
         np.save(f'{o}/footprint.npy', V)
+        # compact-source footprint (every blob, whatever its class) for downstream screening
+        np.save(f'{o}/compact_sources.npy', (self.R.inv(self.src.astype(np.uint8)) > 0) & V)
         self.info['classes'] = stats
         self.info['stars'] = [dict(s, x=None, y=None) for s in []]
         # star positions back in image coordinates

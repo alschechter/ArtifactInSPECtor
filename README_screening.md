@@ -34,3 +34,41 @@ Extra Python packages: `opencv-python-headless`, `scikit-image` (scipy/numpy/pil
 * `--mask-angle DEG`     force the dispersion angle instead of measuring it
 
 Thresholds live in `artifact_screen.DEFAULTS`.
+
+## Cutouts in the dispersion frame (spectra exactly horizontal)
+By default every cutout (and hence every SAM mask) is taken from a copy of the detector image in
+which the dispersion direction runs exactly along rows. **No pixel value is interpolated**:
+* quarter turns (e.g. RGS270) use `np.rot90` (exact);
+* the residual grism tilt is removed by moving whole detector columns up or down by an integer
+  number of pixels (a column shear). Every cutout pixel is an original detector pixel, only moved.
+  Spectra then follow a +/-0.5 px staircase along rows, and objects are sheared by the tilt angle
+  (about 4 deg for the tilted grisms).
+* The angle is first measured by `euclid_mask` and then refined from the continuum residuals
+  themselves (length-weighted median slope of the long, thin streaks), typically to ~0.03 deg.
+  Pixels created outside the detector by the shear are filled with 0 (continuum-subtracted
+  cutout) or the image median (pre-subtraction cutout).
+
+Per detector: `<id>_DET<nn>_dispersion_frame.json` (angle, quarter turns, shear, padding) and
+`<id>_DET<nn>_dispersion_frame.png` (the whole detector in that frame, for a visual check).
+CSV columns: `det_*` stay in detector pixels; `frame_*`, `cutout_*` and `local_*` are in the
+dispersion frame; `frame_angle_deg`, `frame_k90`, `frame_shear_tan`, `frame_pad` describe it.
+`dispersion_frame.DispersionFrame(shape, angle).to_detector(x, y)` maps frame pixels (e.g. a SAM
+mask placed at cutout_x0/y0) back to detector pixels.
+
+Options: `--no-rotate` (cut out in the detector frame, old behaviour);
+`--dispersion-angle DEG` (use this angle instead of measuring it; alias `--mask-angle`).
+
+## Screening happens BEFORE merging (update)
+Every raw SEP detection (hot, cold and dark passes) is screened on its own, before the 30/10 px
+merge, so a spectrum can no longer be merged together with a nearby zeroth order or artifact into
+one large box:
+* dropped: detections that are only continuum and/or emission-line pixels (rules above). A compact
+  detection on a continuum is dropped too **unless** `compact_sources.npy` (every blob found by
+  euclid_mask, whatever its class) shows a round blob at least 4 px tall inside it -- e.g. a
+  zeroth order sitting on the spectrum. Short spectrum segments are 1-3 px tall and do not count.
+* split: a long detection that is >=80 % continuum but touches zeroth-order / artifact / snowball
+  pixels is replaced by compact boxes around those pixels (+5 px); the spectrum part is dropped
+  (`continuum_split` in the screened-out CSV, with `n_pieces_kept`).
+* everything else is kept and merged as before; all merged boxes go to SAM.
+`screened_out_<id>_DET<nn>.csv` now lists the raw detections (sep_pass, det bbox, area, reason).
+In the QA image red = merged boxes sent to SAM, orange/green = raw detections screened out.
