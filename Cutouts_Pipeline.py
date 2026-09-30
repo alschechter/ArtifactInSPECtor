@@ -13,6 +13,9 @@ import glob
 import argparse
 from euclid_mask import Pipeline as MaskPipeline
 from artifact_screen import screen_box
+from dispersion_frame import DispersionFrame, refine_dispersion_angle
+import euclid_mask
+import json
 
 parser = argparse.ArgumentParser()
 parser.add_argument("fits_path", help="Path to the input FITS file")
@@ -29,8 +32,10 @@ parser.add_argument(
 )
 parser.add_argument("--no-screen", action="store_true",
                     help="Send every detection to SAM (skip the euclid_mask screening).")
-parser.add_argument("--mask-angle", type=float, default=None,
-                    help="Dispersion angle for euclid_mask in deg (default: measured from the image).")
+parser.add_argument("--dispersion-angle", "--mask-angle", dest="dispersion_angle", type=float, default=None,
+                    help="Dispersion angle in deg (detector frame, y down). Default: measured from the image.")
+parser.add_argument("--no-rotate", action="store_true",
+                    help="Cut out in the detector frame (old behaviour) instead of the dispersion frame.")
 args = parser.parse_args()
 fits_path = args.fits_path
 
@@ -549,7 +554,7 @@ for DET_CODE in det_codes_to_process:
     screen = {}
     if not args.no_screen:
         mask_dir = os.path.join(noboxes_dir, 'euclid_masks')
-        MaskPipeline(noboxes_path, mask_dir, angle=args.mask_angle).run()
+        MaskPipeline(noboxes_path, mask_dir, angle=args.dispersion_angle).run()
         label_map = np.load(os.path.join(mask_dir, 'label_map.npy'))
         for obj in all_merged:
             key = tuple(int(v) for v in obj['bbox'])
@@ -567,6 +572,46 @@ for DET_CODE in det_codes_to_process:
 
     def sent_to_sam(bbox):
         return True if args.no_screen else screen[tuple(int(v) for v in bbox)][0]
+
+    # ── Dispersion frame: cutouts with the spectra exactly along rows ──────────
+    # Quarter turns are exact (np.rot90); the residual grism tilt is removed by moving
+    # whole detector columns up/down by an integer number of pixels (column shear).
+    # No pixel value is interpolated: every cutout pixel is an original detector pixel.
+    if args.no_rotate:
+        frame = DispersionFrame(cs_inpainted.shape, 0.0); angle_info = {'method': 'none (--no-rotate)'}
+    else:
+        if args.dispersion_angle is not None:
+            disp_angle, angle_info = args.dispersion_angle, {'method': 'user'}
+        else:
+            png_gray = np.array(Image.open(noboxes_path).convert('L')).astype(np.float32)
+            if not args.no_screen:
+                coarse = json.load(open(os.path.join(mask_dir, 'run_info.json')))['dispersion_angle_deg']
+                disp_angle, n_st, scat = refine_dispersion_angle(png_gray, label_map, coarse)
+                angle_info = {'method': 'refined on continuum residuals', 'coarse_deg': coarse,
+                              'n_streaks': n_st, 'streak_scatter_deg': scat}
+            else:
+                med = np.median(png_gray); sig = 1.4826 * np.median(np.abs(png_gray - med))
+                z = np.minimum(np.abs(png_gray - med) / sig, 6.0).astype(np.float32)
+                disp_angle = euclid_mask.find_dispersion(z, np.ones(z.shape, bool))[0]
+                angle_info = {'method': 'coarse (screening off)'}
+        frame = DispersionFrame(cs_inpainted.shape, disp_angle)
+        angle_info['dispersion_angle_deg'] = float(disp_angle)
+    frame_info = {**frame.describe(), **angle_info}
+    print(f"Dispersion frame: {frame_info}")
+    with open(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_dispersion_frame.json"), 'w') as fh:
+        json.dump(frame_info, fh, indent=1)
+    cs_frame  = frame.forward(cs_inpainted.astype(np.float32), fill=0.0)
+    pre_frame = frame.forward(sci_masked.astype(np.float32), fill=float(np.nanmedian(sci_masked)))
+    if not args.no_rotate:
+        plt.imsave(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_dispersion_frame.png"),
+                   norm_vis(np.nan_to_num(cs_frame)), cmap='gray', origin='upper')
+
+    def to_frame_box(b):
+        fx0, fy0, fx1, fy1 = frame.box_to_frame(b['xmin'], b['ymin'], b['xmax'], b['ymax'])
+        cx_, cy_ = (frame.to_frame(np.array([c[0] for c in b['centers']]),
+                                   np.array([c[1] for c in b['centers']])) if len(b['centers']) else ([], []))
+        return {**b, 'xmin': fx0, 'ymin': fy0, 'xmax': fx1, 'ymax': fy1,
+                'centers': list(zip(np.atleast_1d(cx_).tolist(), np.atleast_1d(cy_).tolist()))}
 
     # ---------- Cutouts ----------
 
@@ -587,11 +632,12 @@ for DET_CODE in det_codes_to_process:
     print(f"Normal: {len(normal_boxes)}   Tiny (< {TINY_MAX_DIM} px): {len(tiny_boxes)}")
 
 
-    cutouts            = [make_cutout(b, cs_inpainted) for b in normal_boxes]
-    cutouts_precontsub = [make_cutout(b, sci_masked)   for b in normal_boxes]
+    frame_boxes        = [to_frame_box(b) for b in normal_boxes]
+    cutouts            = [make_cutout(fb, cs_frame)  for fb in frame_boxes]
+    cutouts_precontsub = [make_cutout(fb, pre_frame) for fb in frame_boxes]
 
-    for box, (cutout, lxmin, lymin, lxmax, lymax, crop_x0, crop_y0), (precontsub, *_) in zip(normal_boxes, cutouts, cutouts_precontsub):
-        x0, y0 = box['xmin'], box['ymin']
+    for box, fbox, (cutout, lxmin, lymin, lxmax, lymax, crop_x0, crop_y0), (precontsub, *_) in zip(normal_boxes, frame_boxes, cutouts, cutouts_precontsub):
+        x0, y0 = box['xmin'], box['ymin']          # stem keeps detector coordinates
         x1, y1 = box['xmax'], box['ymax']
         h_co, w_co = cutout.shape
         lxmin_pad = max(0,    lxmin - BBOX_PAD)
@@ -604,7 +650,7 @@ for DET_CODE in det_codes_to_process:
         np.save(os.path.join(CUTOUT_DIR, f"{stem}_bbox.npy"),
                 np.array([lxmin_pad, lymin_pad, lxmax_pad, lymax_pad], dtype=np.float32))
         local_centers = np.array(
-            [[cx - crop_x0, cy - crop_y0] for cx, cy in box['centers']], dtype=np.float32)
+            [[cx - crop_x0, cy - crop_y0] for cx, cy in fbox['centers']], dtype=np.float32)
         np.save(os.path.join(CUTOUT_DIR, f"{stem}_points.npy"), local_centers)
         if box.get('source_type') == 'dark':
             np.save(os.path.join(CUTOUT_DIR, f"{stem}_dark.npy"), np.array(True))
@@ -612,7 +658,8 @@ for DET_CODE in det_codes_to_process:
 
 
     # ── Build detection CSV ────────────────────────────────────────────────────
-    # All coordinates are in the individual detector's own pixel space.
+    # det_* coordinates are in the detector's own pixel space; frame_* and cutout_*/local_*
+    # coordinates are in the dispersion frame the cutouts were taken from (see *_dispersion_frame.json).
     #
     # Columns:
     #   source_fits                   — original FITS basename (trace back to main file + detector)
@@ -631,18 +678,21 @@ for DET_CODE in det_codes_to_process:
             continue
 
         cx, cy   = (xmin + xmax) // 2, (ymin + ymax) // 2
-        bw, bh   = xmax - xmin, ymax - ymin
+        # cutout geometry is computed in the dispersion frame (same as make_cutout)
+        fxmin, fymin, fxmax, fymax = frame.box_to_frame(xmin, ymin, xmax, ymax)
+        fcx, fcy = (fxmin + fxmax) // 2, (fymin + fymax) // 2
+        bw, bh   = fxmax - fxmin, fymax - fymin
         aspect   = bw / bh if bh > 0 else float('inf')
         scale    = SCALE_ELONGATED if aspect > ELONGATED_THRESH else SCALE_COMPACT
         half     = max(int(scale * max(bw, bh)) // 2, 20)
         side     = 2 * half
-        x0 = int(np.clip(cx - half, 0, cs_inpainted.shape[1] - side))
-        y0 = int(np.clip(cy - half, 0, cs_inpainted.shape[0] - side))
+        x0 = int(np.clip(fcx - half, 0, cs_frame.shape[1] - side))
+        y0 = int(np.clip(fcy - half, 0, cs_frame.shape[0] - side))
 
-        lxmin = int(np.clip(xmin - x0, 0, side))
-        lymin = int(np.clip(ymin - y0, 0, side))
-        lxmax = int(np.clip(xmax - x0, 0, side))
-        lymax = int(np.clip(ymax - y0, 0, side))
+        lxmin = int(np.clip(fxmin - x0, 0, side))
+        lymin = int(np.clip(fymin - y0, 0, side))
+        lxmax = int(np.clip(fxmax - x0, 0, side))
+        lymax = int(np.clip(fymax - y0, 0, side))
         lxmin_pad = max(0,    lxmin - BBOX_PAD)
         lymin_pad = max(0,    lymin - BBOX_PAD)
         lxmax_pad = min(side, lxmax + BBOX_PAD)
@@ -658,7 +708,13 @@ for DET_CODE in det_codes_to_process:
             'det_ymax'    : ymax,
             'det_centerx'      : cx,
             'det_centery'      : cy,
-            # cutout window in detector pixel coords
+            # merged bbox in the dispersion frame
+            'frame_xmin'  : fxmin,
+            'frame_ymin'  : fymin,
+            'frame_xmax'  : fxmax,
+            'frame_ymax'  : fymax,
+            # cutout window in DISPERSION-FRAME pixel coords (see *_dispersion_frame.json;
+            # dispersion_frame.DispersionFrame(...).to_detector maps back to the detector)
             'cutout_x0'   : x0,
             'cutout_y0'   : y0,
             'cutout_x1'   : x0 + side,
@@ -677,6 +733,10 @@ for DET_CODE in det_codes_to_process:
             'source_type' : 'dark' if (xmin, ymin, xmax, ymax) in dark_bbox_set else 'bright',
             # stem links this row to its .npy cutout and SAM mask
             'cutout_stem' : f"cutout_{fits_id}_DET{DET_CODE}_{xmin}_{xmax}_{ymin}_{ymax}",
+            'frame_angle_deg' : round(frame_info.get('dispersion_angle_deg', 0.0), 4),
+            'frame_k90'       : frame.k90,
+            'frame_shear_tan' : round(frame.t, 8),
+            'frame_pad'       : frame.pad,
             **({} if args.no_screen else {
                 'sent_to_sam'     : int(screen[(xmin, ymin, xmax, ymax)][0]),
                 'screen_reason'   : screen[(xmin, ymin, xmax, ymax)][1],

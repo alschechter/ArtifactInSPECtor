@@ -9,7 +9,7 @@
 #SBATCH --mail-type=BEGIN,END,FAIL
 
 # Test the sam-screening version of the cutouts step on ONE detector, from a clean slate.
-# Usage:  sbatch test_screening.sh 2681 23
+# Usage:  cd <folder with the code AND Euclid_Images/>;  sbatch test_screening.sh 2681 23
 # Old results for that detector are moved to <det>/old_<timestamp>/, not deleted.
 
 set -euo pipefail
@@ -19,11 +19,22 @@ DET=${2:?give a detector code, e.g. 23}
 module load python/3.10.10-gcc-13.1.0-ucftoxt
 source ~/envs/AISpector/bin/activate
 
-BASE_DIR=/users/7/aimees/AI_Inspector
+# Code and data folder: the directory you ran sbatch from (override with BASE_DIR=... sbatch ...).
+# Cutouts_Pipeline.py looks for calib/, Official-Roman-Artifact-Detection/ and writes <fits>/<det>/
+# next to itself, so the code must live in the same folder as the data.
+BASE_DIR=${BASE_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}
 cd "$BASE_DIR"
+echo "BASE_DIR = $BASE_DIR   (git branch: $(git branch --show-current 2>/dev/null || echo 'not a git repo'))"
+[ -d "$BASE_DIR/Euclid_Images" ] || { echo "ERROR: $BASE_DIR/Euclid_Images not found - run sbatch from the folder that holds the data"; exit 1; }
 
-python -c "import cv2, skimage, euclid_mask, artifact_screen" \
-  || { echo "Missing deps: pip install opencv-python-headless scikit-image"; exit 1; }
+# the new code must sit next to Cutouts_Pipeline.py in $BASE_DIR
+for f in Cutouts_Pipeline.py euclid_mask.py artifact_screen.py; do
+    [ -f "$BASE_DIR/$f" ] || { echo "ERROR: $BASE_DIR/$f not found - check out the sam-screening branch there or copy the file in"; exit 1; }
+done
+grep -q "artifact_screen" "$BASE_DIR/Cutouts_Pipeline.py" \
+  || { echo "ERROR: $BASE_DIR/Cutouts_Pipeline.py is the old version (no screening)"; exit 1; }
+python -c "import cv2, skimage" \
+  || { echo "ERROR: missing packages - run: pip install opencv-python-headless scikit-image"; exit 1; }
 
 matches=("$BASE_DIR"/Euclid_Images/*_${FITS}_*.fits)
 fits_file="${matches[0]}"
