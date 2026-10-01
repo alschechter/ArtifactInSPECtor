@@ -12,7 +12,7 @@
 # compared with the normal run. Output goes to <fits>/<det>/aggressive/ (cutouts, CSVs, SAM results);
 # QA images are <id>_DET<nn>_screened_aggressive.png and _sam_boxes_aggressive.png in <fits>/<det>/.
 # Usage:  cd <folder with the code AND Euclid_Images/>;  sbatch test_aggressive.sh 2681 23
-# Old results for that detector are moved to <det>/old_<timestamp>/, not deleted.
+# A previous aggressive run is moved to <det>/aggressive_old_<timestamp>/; the normal run is not touched.
 
 set -euo pipefail
 FITS=${1:?give a fits number, e.g. 2681}
@@ -30,7 +30,7 @@ echo "BASE_DIR = $BASE_DIR   (git branch: $(git branch --show-current 2>/dev/nul
 [ -d "$BASE_DIR/Euclid_Images" ] || { echo "ERROR: $BASE_DIR/Euclid_Images not found - run sbatch from the folder that holds the data"; exit 1; }
 
 # the new code must sit next to Screen_Cutouts_Pipeline.py in $BASE_DIR
-for f in Screen_Cutouts_Pipeline.py euclid_mask.py artifact_screen.py dispersion_frame.py; do
+for f in Screen_Cutouts_Pipeline.py euclid_mask.py artifact_screen.py dispersion_frame.py compare_aggressive.py; do
     [ -f "$BASE_DIR/$f" ] || { echo "ERROR: $BASE_DIR/$f not found - check out the sam-screening branch there or copy the file in"; exit 1; }
 done
 grep -q "artifact_screen" "$BASE_DIR/Screen_Cutouts_Pipeline.py" \
@@ -69,4 +69,12 @@ print("screened out by reason:\n", s['screen_reason'].value_counts().to_string()
 EOF
 echo "QA images: $(ls "$detdir"/*_DET${DET}_screened_aggressive.png "$detdir"/*_DET${DET}_sam_boxes_aggressive.png 2>/dev/null)"
 echo "Masks:     $detdir/euclid_masks/classified_overlay_legend.png"
+# collect only the cutouts that differ from the normal run (if there is one) for easy browsing
+if [ -d "$detdir/cutouts" ]; then
+    echo "=== Differences from the normal run ==="
+    python "$BASE_DIR/compare_aggressive.py" "$detdir"
+    echo "Browse: $detdir/dropped_by_aggressive/*.png  (index.csv lists why each was dropped)"
+else
+    echo "No normal run in $detdir/cutouts yet - run test_screening.sh $FITS $DET, then: python compare_aggressive.py $detdir"
+fi
 echo "Next: SUBDIR=aggressive sbatch run_sam_minthresh.sh $FITS $DET   then   SUBDIR=aggressive sbatch runPreContSub.sh $FITS $DET"
