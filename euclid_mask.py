@@ -581,6 +581,9 @@ class Pipeline:
                     for j in range(i + 1, len(px)):
                         if abs(py[i] - py[j]) <= 3 and lo - 1 <= abs(px[i] - px[j]) <= hi + 6:
                             if dt[(py[i] + py[j]) // 2, (px[i] + px[j]) // 2] < 0.8 * min(dt[py[i], px[i]], dt[py[j], px[j]]): comp_paired[c] = True
+        # every component that LOOKS like a pair (two peaks on one row at the measured separation),
+        # before the stricter shape/stripe checks: used downstream so no zeroth-order candidate is lost
+        self.zo_cand = comp_paired[lab]
         art_lines = self.trail | self.arc | self.column
         art_zone = cv2.dilate(art_lines.astype(np.uint8), E(3)) > 0
         cls = np.zeros(n + 1, np.uint8); sub = np.zeros(n + 1, np.uint8)
@@ -673,6 +676,7 @@ class Pipeline:
         np.save(f'{o}/footprint.npy', V)
         # compact-source footprint (every blob, whatever its class) for downstream screening
         np.save(f'{o}/compact_sources.npy', (self.R.inv(self.src.astype(np.uint8)) > 0) & V)
+        np.save(f'{o}/zo_candidates.npy', (self.R.inv(self.zo_cand.astype(np.uint8)) > 0) & V)
         self.info['classes'] = stats
         self.info['stars'] = [dict(s, x=None, y=None) for s in []]
         # star positions back in image coordinates
