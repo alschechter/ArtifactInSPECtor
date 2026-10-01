@@ -13,7 +13,7 @@ from astropy.convolution import Gaussian2DKernel
 import glob
 import argparse
 from euclid_mask import Pipeline as MaskPipeline
-from artifact_screen import screen_box, find_blobs, screen_box_aggressive, hard_artifact_map
+from artifact_screen import screen_box, find_blobs
 from dispersion_frame import DispersionFrame, refine_dispersion_angle
 import euclid_mask
 import json
@@ -35,24 +35,12 @@ parser.add_argument("--no-screen", action="store_true",
                     help="Send every detection to SAM (skip the euclid_mask screening).")
 parser.add_argument("--dispersion-angle", "--mask-angle", dest="dispersion_angle", type=float, default=None,
                     help="Dispersion angle in deg (detector frame, y down). Default: measured from the image.")
-parser.add_argument("--aggressive", action="store_true",
-                    help="Drop every box that sits on a spectrum, even with a zeroth order / emission blob on it, "
-                         "unless it holds a snowball, star, trail, ghost or column. Cutouts and CSVs go to "
-                         "./aggressive/ and the QA images get an _aggressive suffix, so both modes can be compared.")
 parser.add_argument("--no-rotate", action="store_true",
                     help="Cut out in the detector frame (old behaviour) instead of the dispersion frame.")
 args = parser.parse_args()
-args.fits_path = os.path.abspath(args.fits_path)          # resolve before any chdir below
-_SCRIPT_FILE = os.path.abspath(__file__)
-QA_SUFFIX = '_aggressive' if args.aggressive else ''
-if args.aggressive:
-    # keep the aggressive run's cutouts / CSVs apart from the normal run in the same detector folder
-    os.makedirs('aggressive', exist_ok=True)
-    os.chdir('aggressive')
-    print(f"Aggressive continuum removal: writing cutouts and CSVs to {os.getcwd()}")
 fits_path = args.fits_path
 
-SCRIPT_DIR = os.path.dirname(_SCRIPT_FILE)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CALIB_DIR = os.path.join(SCRIPT_DIR, "Official-Roman-Artifact-Detection")
 G_nb = gelsa.Gelsa(
     os.path.join(CALIB_DIR, "calib/gelsa_config.json"),
@@ -576,15 +564,9 @@ for DET_CODE in det_codes_to_process:
         blob_map, pair_map = find_blobs(cs_inpainted, pair_range=(int(pair_rng[0]) - 1, int(pair_rng[1]) + 1),
                                         valid=np.isfinite(cs_inpainted))
         print(f"Blob test: {ndimage.label(blob_map)[1]} round blobs, {ndimage.label(pair_map)[1]} blobs in pairs")
-        art_type = np.load(os.path.join(mask_dir, 'artifact_type_map.npy'))
-        if args.aggressive:
-            _cs = np.nan_to_num(cs_inpainted); _med = np.median(_cs)
-            z_img = (_cs - _med) / (1.4826 * np.median(np.abs(_cs - _med)) + 1e-12)
         for obj in all_merged:
             key = tuple(int(v) for v in obj['bbox'])
             screen[key] = screen_box(key, label_map, compact_map, zo_cand_map, blob_map, pair_map)
-            if args.aggressive:
-                screen[key] = screen_box_aggressive(key, label_map, art_type, z_img, normal=screen[key])
         n_send = sum(s[0] for s in screen.values())
         print(f"Screening: {n_send} / {len(screen)} detections sent to SAM")
 
@@ -592,12 +574,11 @@ for DET_CODE in det_codes_to_process:
         # A long, thin box that is mostly continuum is sent only because something small sits on
         # it (a round blob, pair, zeroth order, snowball, emission blob or a star/trail/ghost/column
         # pixel). Replace it by compact boxes around those things; the rest of the spectrum is dropped.
+        art_type = np.load(os.path.join(mask_dir, 'artifact_type_map.npy'))
         # (emission-line pixels on a spectrum are represented by the light-profile maps: a real
         #  blob there is round; knots of the spectrum itself are not)
         keep_px = (blob_map | pair_map | zo_cand_map | np.isin(label_map, (1, 5))
                    | ((label_map == 4) & np.isin(art_type, (1, 2, 3, 4))))
-        if args.aggressive:
-            keep_px = hard_artifact_map(label_map, art_type)   # only snowballs / stars / trails / ghosts / columns
         H_, W_ = label_map.shape; TRIM_MARGIN = 6
         dark_ids = {id(o) for o in merged_dark}
         new_merged, trimmed = [], []
@@ -632,8 +613,6 @@ for DET_CODE in det_codes_to_process:
             for pc in pieces:
                 k2 = tuple(int(v) for v in pc['bbox'])
                 screen[k2] = screen_box(k2, label_map, compact_map, zo_cand_map, blob_map, pair_map)
-                if args.aggressive:
-                    screen[k2] = (True, 'hard_artifact', screen[k2][2])
                 if id(obj) in dark_ids: merged_dark.append(pc)
                 new_merged.append(pc)
         if trimmed:
@@ -648,8 +627,6 @@ for DET_CODE in det_codes_to_process:
         if args.no_screen: return False
         x0_, y0_, x1_, y1_ = [int(v) for v in bbox]
         sl_ = np.s_[max(0, y0_ - 2):y1_ + 3, max(0, x0_ - 2):x1_ + 3]
-        if args.aggressive and (label_map[sl_] == 3).sum() > 2:
-            return False                 # aggressive: a blob on a spectrum gets no cutout
         return bool(blob_map[sl_].any() or pair_map[sl_].any())
 
     # ── Dispersion frame: cutouts with the spectra exactly along rows ──────────
@@ -766,7 +743,7 @@ for DET_CODE in det_codes_to_process:
     for k in sam_keys:              _rect(dd, k, SAM_COL)
     _legend(det_img, [(f"cutout for SAM ({len(sam_keys)})", SAM_COL),
                       (f"no cutout ({len(cont_keys)} continuum, {len(tiny_keys)} tiny)", NOT_COL)])
-    det_img.save(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_sam_boxes{QA_SUFFIX}.png"))
+    det_img.save(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_sam_boxes.png"))
 
     fr_rgb = (plt.cm.gray(norm_vis(np.nan_to_num(cs_frame)))[..., :3] * 255).astype(np.uint8)
     fr_img = Image.fromarray(fr_rgb); fd = ImageDraw.Draw(fr_img)
@@ -776,7 +753,7 @@ for DET_CODE in det_codes_to_process:
     for k in sam_keys:  _rect(fd, frame.box_to_frame(*k), (255, 0, 0))
     _legend(fr_img, [("sent to SAM", (255, 0, 0)), ("screened out: continuum (thin = trimmed spectrum)", CONT_COL),
                      ("tiny, no cutout", TINY_COL)])
-    fr_img.save(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_screened{QA_SUFFIX}.png"))
+    fr_img.save(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_screened.png"))
 
     # ── Build detection CSV ────────────────────────────────────────────────────
     # det_* coordinates are in the detector's own pixel space; frame_* and cutout_*/local_*
