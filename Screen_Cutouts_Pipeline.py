@@ -13,7 +13,7 @@ from astropy.convolution import Gaussian2DKernel
 import glob
 import argparse
 from euclid_mask import Pipeline as MaskPipeline
-from artifact_screen import screen_box
+from artifact_screen import screen_box, find_blobs
 from dispersion_frame import DispersionFrame, refine_dispersion_angle
 import euclid_mask
 import json
@@ -453,6 +453,24 @@ for DET_CODE in det_codes_to_process:
     # ── Plot combined result ──────────────────────────────────────────────────
     pad = 5
     
+    hot_dicts   = sep_to_objlist(hot_final)
+    merged_hot  = merge_objects(hot_dicts,  h_proximity=30, v_proximity=10,
+                                elongated_thresh=3.0, compact_proximity_scale=1)
+    print(f"Hot before merge:  {len(hot_final):4d}   after: {len(merged_hot)}")
+
+    cold_dicts  = sep_to_objlist(cold_final)
+    merged_cold = merge_objects(cold_dicts, h_proximity=30, v_proximity=10,
+                                elongated_thresh=3.0, compact_proximity_scale=1)
+    print(f"Cold before merge: {len(cold_final):4d}   after: {len(merged_cold)}")
+
+    dark_dicts  = sep_to_objlist(dark_objs)
+    merged_dark = merge_objects(dark_dicts, h_proximity=30, v_proximity=10,
+                                elongated_thresh=3.0, compact_proximity_scale=1)
+    merged_dark = [o for o in merged_dark if o['area'] > DARK_MIN_AREA]
+    print(f"Dark before merge: {len(dark_objs):4d}   after: {len(merged_dark)} (area > {DARK_MIN_AREA})")
+
+    all_merged = merged_cold + merged_hot + merged_dark
+
     norm_vis = simple_norm(cs_inpainted, stretch='asinh', min_percent=1, max_percent=99)
 
     # Write the array straight to a raster via imsave — no Figure/Axes, no dpi,
@@ -471,88 +489,6 @@ for DET_CODE in det_codes_to_process:
     os.makedirs(noboxes_dir, exist_ok=True)
     noboxes_path = os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_noboxes.png")
     plt.imsave(noboxes_path, rgba, origin='upper')
-
-    # ── Screen individual SEP detections BEFORE merging ────────────────────────
-    # The mask code runs on the pixel-exact noboxes PNG (detector coordinates). Each raw
-    # SEP detection is screened on its own; detections that are confidently only
-    # continuum and/or emission-line pixels are dropped here, so a long spectrum can no
-    # longer be merged together with a nearby zeroth order / artifact into one big box.
-    # Everything else (zeroth orders, stars, snowballs, ghosts, trails, other artifacts,
-    # unclassified, mixed) is kept and merged as before.
-    screened_out = []
-    if not args.no_screen:
-        mask_dir = os.path.join(noboxes_dir, 'euclid_masks')
-        MaskPipeline(noboxes_path, mask_dir, angle=args.dispersion_angle).run()
-        label_map = np.load(os.path.join(mask_dir, 'label_map.npy'))
-        compact_map = np.load(os.path.join(mask_dir, 'compact_sources.npy'))
-
-        H_lm, W_lm = label_map.shape
-        keep_cls = np.isin(label_map, (1, 4, 5))        # zeroth order, artifact, snowball
-
-        def _sub_obj(x0, y0, x1, y1, npix):
-            w, h = float(x1 - x0), float(y1 - y0)
-            return {'bbox': [float(x0), float(y0), float(x1), float(y1)],
-                    'centroid': [(x0 + x1) / 2.0, (y0 + y1) / 2.0], 'area': float(npix),
-                    'width': w, 'height': h, 'aspect_ratio': w / h if h > 0 else float('inf'),
-                    'fill_ratio': npix / (w * h) if w * h > 0 else 0.0, 'label': 0}
-
-        def prescreen(dicts, kind, margin=5):
-            kept = []
-            for o in dicts:
-                key = tuple(int(round(v)) for v in o['bbox'])
-                send, reason, fr = screen_box(key, label_map, compact_map)
-                if not send:
-                    screened_out.append({'kind': kind, 'bbox': key, 'reason': reason, 'fr': fr,
-                                         'area': o['area']})
-                    continue
-                xmin, ymin, xmax, ymax = key
-                w, h = xmax - xmin, ymax - ymin
-                # A detection that is mostly spectrum but touches a zeroth order / artifact /
-                # snowball: keep only compact boxes around those pixels, drop the spectrum part.
-                if fr['continuum'] >= 0.8 and max(w, h) >= 3 * max(min(w, h), 1) and max(w, h) >= 60:
-                    sub = keep_cls[max(0, ymin - 2):min(H_lm, ymax + 3), max(0, xmin - 2):min(W_lm, xmax + 3)]
-                    lab_s, n_s = ndimage.label(sub, structure=np.ones((3, 3)))
-                    pieces = []
-                    for sl in ndimage.find_objects(lab_s):
-                        if sl is None: continue
-                        y0 = max(0, ymin - 2) + sl[0].start - margin; y1 = max(0, ymin - 2) + sl[0].stop + margin
-                        x0 = max(0, xmin - 2) + sl[1].start - margin; x1 = max(0, xmin - 2) + sl[1].stop + margin
-                        pieces.append(_sub_obj(max(0, x0), max(0, y0), min(W_lm - 1, x1), min(H_lm - 1, y1),
-                                               int((lab_s[sl] > 0).sum())))
-                    if pieces:
-                        kept.extend(pieces)
-                        screened_out.append({'kind': kind, 'bbox': key, 'reason': 'continuum_split',
-                                             'fr': fr, 'area': o['area'], 'n_pieces_kept': len(pieces)})
-                        continue
-                kept.append(o)
-            return kept
-
-    hot_dicts   = sep_to_objlist(hot_final)
-    cold_dicts  = sep_to_objlist(cold_final)
-    dark_dicts  = sep_to_objlist(dark_objs)
-    if not args.no_screen:
-        n_raw = len(hot_dicts) + len(cold_dicts) + len(dark_dicts)
-        hot_dicts  = prescreen(hot_dicts,  'hot')
-        cold_dicts = prescreen(cold_dicts, 'cold')
-        dark_dicts = prescreen(dark_dicts, 'dark')
-        print(f"Screening before merge: dropped {len(screened_out)} / {n_raw} raw detections "
-              f"(continuum/emission only)")
-
-    merged_hot  = merge_objects(hot_dicts,  h_proximity=30, v_proximity=10,
-                                elongated_thresh=3.0, compact_proximity_scale=1)
-    print(f"Hot before merge:  {len(hot_dicts):4d}   after: {len(merged_hot)}")
-
-    merged_cold = merge_objects(cold_dicts, h_proximity=30, v_proximity=10,
-                                elongated_thresh=3.0, compact_proximity_scale=1)
-    print(f"Cold before merge: {len(cold_dicts):4d}   after: {len(merged_cold)}")
-
-    merged_dark = merge_objects(dark_dicts, h_proximity=30, v_proximity=10,
-                                elongated_thresh=3.0, compact_proximity_scale=1)
-    merged_dark = [o for o in merged_dark if o['area'] > DARK_MIN_AREA]
-    print(f"Dark before merge: {len(dark_dicts):4d}   after: {len(merged_dark)} (area > {DARK_MIN_AREA})")
-
-    all_merged = merged_cold + merged_hot + merged_dark
-
 
     # Draw detection boxes (same pixel coordinates that go into the detections CSV)
     # directly in pixel space with PIL — also no resampling — onto a second,
@@ -611,27 +547,87 @@ for DET_CODE in det_codes_to_process:
 
     zo_matched_bboxes = {tuple(int(v) for v in o['bbox']) for o in zo_matched}
 
-    # ── Describe the merged boxes (all of them go to SAM) and write the QA image ──
+    # ── Screen detections with euclid_mask ─────────────────────────────────────
+    # The mask code runs on the same pixel-exact noboxes PNG, so its maps are in
+    # detector pixel coordinates. Everything goes to SAM except merged boxes that are
+    # confidently continuum only (see artifact_screen.py).
     screen = {}
     if not args.no_screen:
+        mask_dir = os.path.join(noboxes_dir, 'euclid_masks')
+        MaskPipeline(noboxes_path, mask_dir, angle=args.dispersion_angle).run()
+        label_map   = np.load(os.path.join(mask_dir, 'label_map.npy'))
+        compact_map = np.load(os.path.join(mask_dir, 'compact_sources.npy'))
+        zo_cand_map = np.load(os.path.join(mask_dir, 'zo_candidates.npy'))
+        # light-profile test on the image itself: round blobs (zeroth orders, snowballs, ...) and
+        # pairs at the measured zeroth-order separation, wherever they sit (also on spectra)
+        pair_rng = json.load(open(os.path.join(mask_dir, 'run_info.json')))['pair_separation_px']['accepted_range']
+        blob_map, pair_map = find_blobs(cs_inpainted, pair_range=(int(pair_rng[0]) - 1, int(pair_rng[1]) + 1),
+                                        valid=np.isfinite(cs_inpainted))
+        print(f"Blob test: {ndimage.label(blob_map)[1]} round blobs, {ndimage.label(pair_map)[1]} blobs in pairs")
         for obj in all_merged:
             key = tuple(int(v) for v in obj['bbox'])
-            screen[key] = screen_box(key, label_map, compact_map)      # class fractions / dominant class, for the CSV
-        # QA image: red = merged box sent to SAM; orange / green = raw detection screened out
-        # before merging as continuum / emission line
-        qa = Image.open(noboxes_path).convert('RGB'); qd = ImageDraw.Draw(qa)
-        qcol = {'continuum': (255, 160, 0), 'emission_line': (60, 255, 60), 'continuum_split': (255, 160, 0)}
-        for so in screened_out:
-            xmin, ymin, xmax, ymax = so['bbox']
-            qd.rectangle([xmin - pad, ymin - pad, xmax + pad, ymax + pad], outline=qcol[so['reason']], width=1)
-        for key in screen:
-            xmin, ymin, xmax, ymax = key
-            qd.rectangle([xmin - pad, ymin - pad, xmax + pad, ymax + pad], outline=(255, 0, 0), width=1)
-        qa.save(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_screened.png"))
+            screen[key] = screen_box(key, label_map, compact_map, zo_cand_map, blob_map, pair_map)
+        n_send = sum(s[0] for s in screen.values())
+        print(f"Screening: {n_send} / {len(screen)} detections sent to SAM")
+
+        # ── Trim long spectrum boxes down to what is actually on them ──────────────
+        # A long, thin box that is mostly continuum is sent only because something small sits on
+        # it (a round blob, pair, zeroth order, snowball, emission blob or a star/trail/ghost/column
+        # pixel). Replace it by compact boxes around those things; the rest of the spectrum is dropped.
+        art_type = np.load(os.path.join(mask_dir, 'artifact_type_map.npy'))
+        # (emission-line pixels on a spectrum are represented by the light-profile maps: a real
+        #  blob there is round; knots of the spectrum itself are not)
+        keep_px = (blob_map | pair_map | zo_cand_map | np.isin(label_map, (1, 5))
+                   | ((label_map == 4) & np.isin(art_type, (1, 2, 3, 4))))
+        H_, W_ = label_map.shape; TRIM_MARGIN = 6
+        dark_ids = {id(o) for o in merged_dark}
+        new_merged, trimmed = [], []
+        for obj in all_merged:
+            key = tuple(int(v) for v in obj['bbox'])
+            send, reason, fr = screen[key]
+            bx0, by0, bx1, by1 = key; bw, bh = bx1 - bx0, max(by1 - by0, 1)
+            if not (send and bw >= 80 and bw >= 4 * bh and fr['continuum'] >= 0.5):
+                new_merged.append(obj); continue
+            sub = keep_px[by0:by1 + 1, bx0:bx1 + 1]
+            lab_s, _ = ndimage.label(sub, structure=np.ones((3, 3), bool))
+            pieces = []
+            for sl in ndimage.find_objects(lab_s):
+                if sl is None or sub[sl].sum() < 4: continue
+                px0 = max(0, bx0 + sl[1].start - TRIM_MARGIN); px1 = min(W_ - 1, bx0 + sl[1].stop - 1 + TRIM_MARGIN)
+                py0 = max(0, by0 + sl[0].start - TRIM_MARGIN); py1 = min(H_ - 1, by0 + sl[0].stop - 1 + TRIM_MARGIN)
+                w_, h_ = px1 - px0, py1 - py0
+                if w_ >= 80 and w_ >= 4 * max(h_, 1) and not (label_map[py0:py1 + 1, px0:px1 + 1] == 4).any():
+                    continue                     # a chain along the spectrum itself, not a blob on it
+                pieces.append({'bbox': [px0, py0, px1, py1], 'centroid': [(px0 + px1) / 2, (py0 + py1) / 2],
+                               'area': float(sub[sl].sum()), 'width': w_, 'height': h_,
+                               'aspect_ratio': w_ / h_ if h_ > 0 else float('inf'),
+                               'fill_ratio': 0.0, 'label': 0, 'fragment_count': 1,
+                               'sub_centroids': [[(px0 + px1) / 2, (py0 + py1) / 2]]})
+            if not pieces:
+                # nothing compact on it: the box was sent only for spectrum knots -> treat as continuum
+                if reason in ('round_blob', 'emission_line'):
+                    trimmed.append({'bbox': key, 'reason': 'continuum_trimmed', 'fr': fr, 'n_pieces_kept': 0})
+                    continue
+                new_merged.append(obj); continue
+            trimmed.append({'bbox': key, 'reason': 'continuum_trimmed', 'fr': fr, 'n_pieces_kept': len(pieces)})
+            for pc in pieces:
+                k2 = tuple(int(v) for v in pc['bbox'])
+                screen[k2] = screen_box(k2, label_map, compact_map, zo_cand_map, blob_map, pair_map)
+                if id(obj) in dark_ids: merged_dark.append(pc)
+                new_merged.append(pc)
+        if trimmed:
+            all_merged = new_merged
+            print(f"Trimmed {len(trimmed)} long spectrum boxes to {sum(t_['n_pieces_kept'] for t_ in trimmed)} compact boxes")
 
     def sent_to_sam(bbox):
-        return True          # screening already happened before merging
+        return True if args.no_screen else screen[tuple(int(v) for v in bbox)][0]
 
+    def blob_in(bbox):
+        # tiny detections (< TINY_MAX_DIM) normally get no cutout; they do if they hold a round blob or pair
+        if args.no_screen: return False
+        x0_, y0_, x1_, y1_ = [int(v) for v in bbox]
+        sl_ = np.s_[max(0, y0_ - 2):y1_ + 3, max(0, x0_ - 2):x1_ + 3]
+        return bool(blob_map[sl_].any() or pair_map[sl_].any())
 
     # ── Dispersion frame: cutouts with the spectra exactly along rows ──────────
     # Quarter turns are exact (np.rot90); the residual grism tilt is removed by moving
@@ -684,12 +680,14 @@ for DET_CODE in det_codes_to_process:
         for o in all_merged
     ]
 
+    _k = lambda b: (b['xmin'], b['ymin'], b['xmax'], b['ymax'])
+    _is_tiny = lambda b: max(b['xmax'] - b['xmin'], b['ymax'] - b['ymin']) < TINY_MAX_DIM
+    promoted = {_k(b) for b in all_boxes if _is_tiny(b) and blob_in(_k(b))}
     normal_boxes = [b for b in all_boxes
-                if max(b['xmax'] - b['xmin'], b['ymax'] - b['ymin']) >= TINY_MAX_DIM
-                and sent_to_sam((b['xmin'], b['ymin'], b['xmax'], b['ymax']))]
-    tiny_boxes   = [b for b in all_boxes
-                    if max(b['xmax'] - b['xmin'], b['ymax'] - b['ymin']) <  TINY_MAX_DIM]
-    print(f"Normal: {len(normal_boxes)}   Tiny (< {TINY_MAX_DIM} px): {len(tiny_boxes)}")
+                    if (not _is_tiny(b) or _k(b) in promoted) and sent_to_sam(_k(b))]
+    tiny_boxes   = [b for b in all_boxes if _is_tiny(b) and _k(b) not in promoted]
+    print(f"Normal: {len(normal_boxes)}   Tiny (< {TINY_MAX_DIM} px): {len(tiny_boxes)}   "
+          f"(tiny with a round blob / pair, cut out anyway: {len(promoted)})")
 
 
     frame_boxes        = [to_frame_box(b) for b in normal_boxes]
@@ -717,6 +715,46 @@ for DET_CODE in det_codes_to_process:
 
 
 
+    # ── QA images ────────────────────────────────────────────────────────────────
+    #  *_sam_boxes.png : detector frame; cyan = cutout made (sent to SAM),
+    #                    magenta = no cutout (screened out as continuum, or tiny < TINY_MAX_DIM px)
+    #  *_screened.png  : dispersion frame (spectra along rows, same frame as the cutouts);
+    #                    red = sent to SAM, orange = screened out as continuum, grey = tiny
+    def _rect(draw, box, col, w=2):
+        bx0, by0, bx1, by1 = box
+        draw.rectangle([bx0 - pad, by0 - pad, bx1 + pad, by1 + pad], outline=col, width=w)
+
+    def _legend(img, items):
+        d = ImageDraw.Draw(img); y = 6
+        d.rectangle([4, 4, 330, 8 + 16 * len(items)], fill=(255, 255, 255))
+        for label, col in items:
+            d.rectangle([8, y + 2, 20, y + 12], outline=col, width=2); d.text((26, y), label, fill=(0, 0, 0)); y += 16
+
+    box_key   = lambda b: (b['xmin'], b['ymin'], b['xmax'], b['ymax'])
+    sam_keys  = [box_key(b) for b in normal_boxes]
+    tiny_keys = [box_key(b) for b in tiny_boxes]
+    cont_keys = [box_key(b) for b in all_boxes
+                 if not sent_to_sam(box_key(b)) and max(b['xmax'] - b['xmin'], b['ymax'] - b['ymin']) >= TINY_MAX_DIM]
+    SAM_COL, NOT_COL, CONT_COL, TINY_COL = (0, 200, 255), (255, 0, 255), (255, 160, 0), (150, 150, 150)
+
+    det_img = Image.open(noboxes_path).convert('RGB'); dd = ImageDraw.Draw(det_img)
+    for k in cont_keys + tiny_keys: _rect(dd, k, NOT_COL)
+    for t_ in (trimmed if not args.no_screen else []): _rect(dd, t_['bbox'], NOT_COL, 1)   # trimmed spectrum (thin)
+    for k in sam_keys:              _rect(dd, k, SAM_COL)
+    _legend(det_img, [(f"cutout for SAM ({len(sam_keys)})", SAM_COL),
+                      (f"no cutout ({len(cont_keys)} continuum, {len(tiny_keys)} tiny)", NOT_COL)])
+    det_img.save(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_sam_boxes.png"))
+
+    fr_rgb = (plt.cm.gray(norm_vis(np.nan_to_num(cs_frame)))[..., :3] * 255).astype(np.uint8)
+    fr_img = Image.fromarray(fr_rgb); fd = ImageDraw.Draw(fr_img)
+    for k in cont_keys: _rect(fd, frame.box_to_frame(*k), CONT_COL)
+    for t_ in (trimmed if not args.no_screen else []): _rect(fd, frame.box_to_frame(*t_['bbox']), CONT_COL, 1)
+    for k in tiny_keys: _rect(fd, frame.box_to_frame(*k), TINY_COL)
+    for k in sam_keys:  _rect(fd, frame.box_to_frame(*k), (255, 0, 0))
+    _legend(fr_img, [("sent to SAM", (255, 0, 0)), ("screened out: continuum (thin = trimmed spectrum)", CONT_COL),
+                     ("tiny, no cutout", TINY_COL)])
+    fr_img.save(os.path.join(noboxes_dir, f"{fits_id}_DET{DET_CODE}_screened.png"))
+
     # ── Build detection CSV ────────────────────────────────────────────────────
     # det_* coordinates are in the detector's own pixel space; frame_* and cutout_*/local_*
     # coordinates are in the dispersion frame the cutouts were taken from (see *_dispersion_frame.json).
@@ -734,7 +772,7 @@ for DET_CODE in det_codes_to_process:
 
     for obj in all_merged:
         xmin, ymin, xmax, ymax = [int(v) for v in obj['bbox']]
-        if max(xmax - xmin, ymax - ymin) < TINY_MAX_DIM:
+        if max(xmax - xmin, ymax - ymin) < TINY_MAX_DIM and (xmin, ymin, xmax, ymax) not in promoted:
             continue
 
         cx, cy   = (xmin + xmax) // 2, (ymin + ymax) // 2
@@ -798,8 +836,8 @@ for DET_CODE in det_codes_to_process:
             'frame_shear_tan' : round(frame.t, 8),
             'frame_pad'       : frame.pad,
             **({} if args.no_screen else {
-                'sent_to_sam'     : 1,
-                'screen_reason'   : screen[(xmin, ymin, xmax, ymax)][1],   # dominant class in the merged box
+                'sent_to_sam'     : int(screen[(xmin, ymin, xmax, ymax)][0]),
+                'screen_reason'   : screen[(xmin, ymin, xmax, ymax)][1],
                 **{f'frac_{k}': round(v, 3) for k, v in screen[(xmin, ymin, xmax, ymax)][2].items()},
             }),
         })
@@ -810,13 +848,15 @@ for DET_CODE in det_codes_to_process:
     else:
         # the main CSV keeps only SAM-bound rows so the SAM / PreContSub steps run unchanged;
         # screened-out rows are kept separately (name does not match detections_*_DET*.csv)
-        df_det = df_all
-        pd.DataFrame([{'source_fits': fits_basename, 'det_code': DET_CODE, 'sep_pass': so['kind'],
-                       'det_xmin': so['bbox'][0], 'det_ymin': so['bbox'][1],
-                       'det_xmax': so['bbox'][2], 'det_ymax': so['bbox'][3], 'area_pix': so['area'],
-                       'screen_reason': so['reason'], 'n_pieces_kept': so.get('n_pieces_kept', 0),
-                       **{f'frac_{k}': round(v, 3) for k, v in so['fr'].items()}}
-                      for so in screened_out]).to_csv(f"screened_out_{fits_id}_DET{DET_CODE}.csv", index=False)
+        df_det = df_all[df_all['sent_to_sam'] == 1]
+        out_rows = df_all[df_all['sent_to_sam'] == 0]
+        if not args.no_screen and trimmed:
+            out_rows = pd.concat([out_rows, pd.DataFrame([{
+                'source_fits': fits_basename, 'det_code': DET_CODE,
+                'det_xmin': t_['bbox'][0], 'det_ymin': t_['bbox'][1], 'det_xmax': t_['bbox'][2], 'det_ymax': t_['bbox'][3],
+                'sent_to_sam': 0, 'screen_reason': t_['reason'], 'n_pieces_kept': t_['n_pieces_kept'],
+                **{f'frac_{k}': round(v, 3) for k, v in t_['fr'].items()}} for t_ in trimmed])], ignore_index=True)
+        out_rows.to_csv(f"screened_out_{fits_id}_DET{DET_CODE}.csv", index=False)
     df_det.to_csv(out_csv, index=False)
     print(f"Saved {len(df_det)} rows → {out_csv}  "
         f"(ZO matched: {df_det['zeroth_order'].sum()}, unmatched: {(df_det['zeroth_order']==0).sum()})")
