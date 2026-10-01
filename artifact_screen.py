@@ -146,3 +146,41 @@ def screen_box(bbox, label_map, compact=None, zo_cand=None, blob_map=None, pair_
 
 def screen_boxes(boxes, label_map, compact=None, zo_cand=None, blob_map=None, pair_map=None, **kw):
     return [screen_box(b, label_map, compact, zo_cand, blob_map, pair_map, **kw) for b in boxes]
+
+
+# ── Aggressive variant (--aggressive) ─────────────────────────────────────────
+HARD_ART_TYPES = (1, 2, 3, 4)       # artifact_type_map: 1 star, 2 trail, 3 ghost/arc, 4 column/bleed
+
+
+def hard_artifact_map(label_map, art_type):
+    """Snowballs plus stars, trails, ghosts/arcs and columns -- the artifacts that are kept even on a
+    spectrum in aggressive mode. Zeroth orders, emission blobs and small residual blobs are not."""
+    return (label_map == SNOW) | ((label_map == ART) & np.isin(art_type, HARD_ART_TYPES))
+
+
+def screen_box_aggressive(bbox, label_map, art_type, z=None, normal=None, **kw):
+    """Aggressive continuum removal: any box that sits on a spectrum is dropped, even if a zeroth
+    order, emission blob or round blob is on it -- unless it holds a hard artifact (snowball, star,
+    trail, ghost/arc, column). Boxes away from spectra fall back to the normal decision `normal`
+    (a (send, reason, fr) tuple from screen_box), so isolated zeroth orders/blobs still go to SAM.
+    On a spectrum = continuum >= 30 % of the recognised pixels or >= 15 % of the box, or (if the
+    masks missed it) a long thin box whose rows are >= 20 % very dark pixels (z < -2)."""
+    p = {**DEFAULTS, **kw}
+    H, W = label_map.shape
+    xmin, ymin, xmax, ymax = [int(round(v)) for v in bbox]
+    x0, y0 = max(0, xmin - p['pad']), max(0, ymin - p['pad'])
+    x1, y1 = min(W, xmax + p['pad'] + 1), min(H, ymax + p['pad'] + 1)
+    reg = label_map[y0:y1, x0:x1]
+    counts = np.bincount(reg.ravel(), minlength=6)[:6]
+    labelled = int(counts[1:].sum())
+    fr = normal[2] if normal is not None else {}
+    hard = int(hard_artifact_map(reg, art_type[y0:y1, x0:x1]).sum())
+    if hard > p['max_keep_px']:
+        return True, 'hard_artifact', fr
+    on_cont = labelled and (counts[CONT] / labelled >= 0.30 or counts[CONT] / max(reg.size, 1) >= 0.15)
+    if on_cont:
+        return False, 'continuum_aggressive', fr
+    w, h = xmax - xmin + 1, ymax - ymin + 1
+    if z is not None and w >= 40 and w >= 4 * h and (z[y0:y1, x0:x1] < -2).mean() >= 0.20:
+        return False, 'streak_signature', fr
+    return normal if normal is not None else (True, 'unclassified', fr)

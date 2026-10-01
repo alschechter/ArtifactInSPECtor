@@ -33,7 +33,7 @@ dets_list=("${ALL_DETS[@]}")
 
 for f in "${fits_list[@]}"; do
     for d in "${dets_list[@]}"; do
-        target="$BASE_DIR/$f/$d"
+        target="$BASE_DIR/$f/$d${SUBDIR:+/$SUBDIR}"     # SUBDIR=aggressive -> the --aggressive run
         if [ ! -d "$target" ]; then
             echo "WARNING: $target does not exist, skipping"
             continue
