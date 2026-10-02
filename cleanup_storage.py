@@ -2,7 +2,9 @@
 """
 cleanup_storage.py -- shrink outputs already written by Screen_Cutouts_Pipeline.py, in place.
 
-    python cleanup_storage.py [BASE_DIR]              # dry run: report what would be saved
+    python cleanup_storage.py [FOLDER]                # dry run: report what would be saved
+    FOLDER = the main folder (all <fits>/<det>/), one FITS folder (e.g. 2681) or one detector
+    folder (e.g. 2681/23). Default: the current folder.
     python cleanup_storage.py [BASE_DIR] --apply      # do it
     python cleanup_storage.py [BASE_DIR] --apply --delete-old   # also delete old_* / aggressive_old_* folders
 
@@ -25,7 +27,38 @@ sam_results*/ (only reported). old_* folders are only deleted with --delete-old.
 import os, re, sys, glob, shutil, argparse
 import numpy as np
 from PIL import Image
-from cutout_boxes import save_boxes, load_boxes
+try:
+    from cutout_boxes import save_boxes, load_boxes
+except ImportError:          # cutout_boxes.py not next to this script: use the same code, built in
+    def save_boxes(path, records):
+        """records: list of (stem, bbox[4], points[n,2], dark: bool)."""
+        stems = np.array([r[0] for r in records], dtype=str)
+        bbox = np.array([np.asarray(r[1], np.float32).ravel()[:4] for r in records], np.float32).reshape(-1, 4)
+        pts = [np.asarray(r[2], np.float32).reshape(-1, 2) for r in records]
+        offs = np.cumsum([0] + [len(p) for p in pts]).astype(np.int64)
+        allp = np.concatenate(pts, 0) if pts else np.zeros((0, 2), np.float32)
+        dark = np.array([bool(r[3]) for r in records], bool)
+        tmp = path + '.tmp.npz'
+        np.savez_compressed(tmp, stems=stems, bbox=bbox, points=allp, points_offset=offs, dark=dark)
+        os.replace(tmp, path)
+
+
+    def load_boxes(cutout_dir='cutouts'):
+        out = {}
+        for f in sorted(glob.glob(os.path.join(cutout_dir, 'boxes_*.npz'))):
+            z = np.load(f)
+            offs = z['points_offset']
+            for i, s in enumerate(z['stems']):
+                out[str(s)] = {'bbox': z['bbox'][i], 'points': z['points'][offs[i]:offs[i + 1]], 'dark': bool(z['dark'][i])}
+        # older runs: one file per cutout
+        for f in glob.glob(os.path.join(cutout_dir, '*_bbox.npy')):
+            s = os.path.basename(f)[:-len('_bbox.npy')]
+            if s in out: continue
+            p = os.path.join(cutout_dir, s + '_points.npy')
+            out[s] = {'bbox': np.load(f).ravel()[:4],
+                      'points': np.load(p).reshape(-1, 2) if os.path.exists(p) else np.zeros((0, 2), np.float32),
+                      'dark': os.path.exists(os.path.join(cutout_dir, s + '_dark.npy'))}
+        return out
 
 MAPS = ('label_map', 'artifact_type_map', 'compact_sources', 'zo_candidates', 'footprint')
 
@@ -131,8 +164,15 @@ def main():
     ap.add_argument('--keep-png', action='store_true', help='keep the boxed detector image <id>_DET<nn>.png as PNG')
     a = ap.parse_args()
     base = os.path.abspath(a.base_dir)
-    det_dirs = sorted(d for d in glob.glob(os.path.join(base, '*', '[0-9][0-9]')) if os.path.isdir(d))
-    if not det_dirs: sys.exit(f"no <fits>/<det>/ folders under {base}")
+    # accept the main folder (<base>/<fits>/<det>/), one FITS folder (<base>/<det>/) or one detector folder
+    is_det = lambda d: re.fullmatch(r'\d\d', os.path.basename(d)) is not None and os.path.isdir(d)
+    if is_det(base):
+        det_dirs = [base]
+    elif any(is_det(d) for d in glob.glob(os.path.join(base, '[0-9][0-9]'))):
+        det_dirs = sorted(d for d in glob.glob(os.path.join(base, '[0-9][0-9]')) if is_det(d))
+    else:
+        det_dirs = sorted(d for d in glob.glob(os.path.join(base, '*', '[0-9][0-9]')) if is_det(d))
+    if not det_dirs: sys.exit(f"no detector folders found at {base} (expected <base>/<fits>/<det>/)")
     print(f"{'APPLYING' if a.apply else 'DRY RUN'} in {base}: {len(det_dirs)} detector folders")
     total_before = sum(size(d) for d in det_dirs)
     plan = Plan(a.apply); old_bytes = 0; sam_bytes = 0; cut_bytes = 0
